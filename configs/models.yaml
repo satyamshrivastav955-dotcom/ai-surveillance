@@ -1,0 +1,31 @@
+# ===== models.yaml =====
+# Central registry of all model weights + inference params.
+# Heavy models are intentionally absent here until their phase is built
+# (pose -> Phase 2, reid/face -> Phase 3, fire/smoke etc -> Phase 4).
+# Every entry is a single source of truth loaded by the relevant core/ wrapper.
+
+detector:
+  name: yolov8n
+  weights: models/yolov8n.pt          # auto-downloaded by ultralytics on first run (~6MB)
+  imgsz: 640                           # 640x640 keeps VRAM low; 960x540 is the upscale-if-needed fallback
+  half: true                           # FP16 on CUDA — see hardware budget Section 1
+  device: cuda:0
+  conf: 0.35
+  iou: 0.5
+  classes: null                        # null = all classes; restrict later to [0] for persons-only where useful
+
+# --- Phase 2+ stubs (uncomment / fill when their phase is built) ---
+# pose:
+#   weights: models/yolov8n-pose.pt
+#   imgsz: 640
+#   half: true
+#   device: cuda:0
+# reid:
+#   weights: models/osnet_x0_25.pt     # OSNet-x0.25 is the lightest ReID
+#   device: cuda:0
+# face_det:
+#   weights: models/scrfd_500m.onnx
+#   device: cuda:0
+# face_emb:
+#   weights: models/mobilefacenet.onnx
+#   device: cuda:0

@@ -1,0 +1,6 @@
+# Phase 1 shared-detector loop weights (auto-downloaded by ultralytics)
+*.pt
+*.onnx
+*.engine
+*.tar
+!README.md

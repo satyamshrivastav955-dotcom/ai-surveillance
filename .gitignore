@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+models/*.pt
+models/*.onnx
+models/*.engine
+benchmarks/vram_log.csv
+*.mp4
+*.avi
+*.mov
+*.mkv

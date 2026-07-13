@@ -1,0 +1,13 @@
+# Ultralytics 8.x, lap, opencv-python, onnxruntime are already installed in this env.
+# Pin for reproducibility:
+ultralytics>=8.4.0
+opencv-python>=4.8
+numpy>=1.26
+torch>=2.1
+pyyaml>=6.0
+scipy>=1.10
+lap>=0.5
+onnxruntime>=1.16
+# Phase 2+ (added when those phases are built):
+# faiss-cpu
+# ultralytics-thop

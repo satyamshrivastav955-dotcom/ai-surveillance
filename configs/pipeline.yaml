@@ -1,0 +1,49 @@
+# ===== pipeline.yaml =====
+# Runtime behavior of the real-time loop. Every feature module is toggleable
+# here (constraint #6) so Phases 2+ get added without code changes to main_loop.
+
+source:
+  type: webcam          # webcam | file | rtsp
+  path: null            # used for `file` and `rtsp`
+  loop: true            # restart file on EOF (let accuracy tests run indefinitely)
+  reconnect: true       # rtsp only — auto-reconnect
+  width: 1280
+  height: 720
+
+display:
+  enabled: true
+  resize_w: 960         # display-only upscale; inference stays at detector.imgsz
+  show_fps: true
+  show_vram: true
+  window: "ai-surveillance (Phase 1)"
+
+# ---- FrameRouter: every stage runs through this scheduler (constraint #4) ----
+# frequency is expressed as `every: N` meaning run once every N frames.
+# 1 = every frame. Heavier stage entries are present but disabled (enabled:false)
+# so adding a phase is: flip enabled + set every.
+router:
+  stages:
+    detect:
+      enabled: true
+      every: 1            # every frame — feeds everything downstream
+    track:
+      enabled: true
+      every: 1            # ByteTrack is CPU-cheap
+    # pose:        { enabled: false, every: 1 }      # Phase 2
+    # reid:        { enabled: false, every: 10 }     # Phase 3
+    # face:        { enabled: false, every: 4 }      # Phase 3
+    # fire_smoke:  { enabled: false, every: 15 }     # Phase 4 (1-2 fps)
+    # crowd:       { enabled: false, every: 30 }     # Phase 4 (1 fps)
+    # violence:    { enabled: false, every: 30 }     # Phase 4 (clip-based)
+    # smoking:     { enabled: false, every: 10 }     # Phase 4
+    # phone:       { enabled: false, every: 10 }    # Phase 4
+
+features:
+  detection: true
+  tracking: true
+
+perf:
+  fps_warn_below: 20    # log a warning if sustained FPS drops below this
+  vram_log_path: benchmarks/vram_log.csv
+  vram_warn_above_gb: 5 # constraint #2 — flag if exceeded
+  vram_log_every_s: 5   # how often to append a VRAM sample
