@@ -15,7 +15,7 @@ display:
   resize_w: 960         # display-only upscale; inference stays at detector.imgsz
   show_fps: true
   show_vram: true
-  window: "ai-surveillance (Phase 2)"
+  window: "ai-surveillance (Phase 3)"
 
 # ---- FrameRouter: every stage runs through this scheduler (constraint #4) ----
 # frequency is expressed as `every: N` meaning run once every N frames.
@@ -31,12 +31,13 @@ router:
       every: 1            # ByteTrack is CPU-cheap
     pose:
       enabled: true
-      every: 2            # every other frame — halves pose overhead (~17% FPS drop vs Phase 1)
-                            # fall state machine still catches fast falls: at 30fps with every=2,
-                            # pose fires at 15fps; a 0.5s fall produces ~7 pose samples, well
-                            # within the 1.5s transition_window_s. See tests/fall_cadence_test.py.
-    # reid:        { enabled: false, every: 10 }     # Phase 3
-    # face:        { enabled: false, every: 4 }      # Phase 3
+      every: 2            # every other frame — halves pose overhead
+    reid:
+      enabled: true
+      every: 10           # only on new/re-appearing tracks (Section 4) — not every frame
+    face:
+      enabled: true
+      every: 4            # every 3rd-5th frame on person crops (Section 4)
     # fire_smoke:  { enabled: false, every: 15 }     # Phase 4 (1-2 fps)
     # crowd:       { enabled: false, every: 30 }     # Phase 4 (1 fps)
     # violence:    { enabled: false, every: 30 }     # Phase 4 (clip-based)
@@ -48,6 +49,9 @@ features:
   tracking: true
   pose: true
   fall_detection: true
+  reid: true
+  face: true
+  identity_fusion: true
 
 perf:
   fps_warn_below: 20    # log a warning if sustained FPS drops below this

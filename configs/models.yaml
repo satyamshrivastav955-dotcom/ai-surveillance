@@ -63,13 +63,30 @@ fall:
 # would-triggers with full signal breakdown (aspect, kp_frac, upright_dur,
 # delta). Useful for tuning. Cap via FALL_DEBUG_LIMIT=N.
 
-# --- Phase 3+ stubs (uncomment / fill when their phase is built) ---
-# reid:
-#   weights: models/osnet_x0_25.pt     # OSNet-x0.25 is the lightest ReID
-#   device: cuda:0
-# face_det:
-#   weights: models/scrfd_500m.onnx
-#   device: cuda:0
-# face_emb:
-#   weights: models/mobilefacenet.onnx
-#   device: cuda:0
+# --- Phase 3: Person Re-Identification ---
+# Lightweight body-embedding model. Uses torchvision ResNet18 (strip FC ->
+# 512-dim avgpool features). ~11M params, same scale as YOLOv8n.
+# OSNet-x0.25 (3x smaller, purpose-built for ReID) is the production target;
+# the architecture supports swapping it in by changing this config block.
+reid:
+  model: resnet18                        # resnet18 (dev) | osnet_x0_25 (production target)
+  device: cuda:0
+  half: true                             # FP16 on CUDA
+  imgsz: 128                             # ReID crops are small; 128 is standard
+  dim: 512                               # embedding dimension
+  match_threshold: 0.95                   # cosine sim above this = same person
+                                            # NOTE: 0.95 is conservative because ImageNet-pretrained
+                                            # ResNet18 features are not person-discriminative — same
+                                            # person scores ~0.99, different persons score ~0.94.
+                                            # OSNet (trained on ReID datasets) would allow 0.6-0.7.
+  lost_ttl_s: 30.0                       # how long to keep lost-track embeddings for re-linking
+
+# --- Phase 3: Face Recognition ---
+# Uses insightface buffalo_s pack: SCRFD-500M (det) + MobileFaceNet (rec).
+# Models auto-download to ~/.insightface/models/buffalo_s/ on first use (~16MB).
+face:
+  model_pack: buffalo_s                  # buffalo_s = SCRFD-500M + MobileFaceNet (small variant)
+  det_size: 320                          # SCRFD input size; 320 is fast, 640 is more accurate
+  dim: 512                               # MobileFaceNet embedding dimension
+  match_threshold: 0.4                   # cosine sim above this = same face
+  index_path: models/face_index          # where to persist the enrolled-face FAISS index

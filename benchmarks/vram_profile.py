@@ -117,11 +117,55 @@ def profile_pose() -> dict:
     return res
 
 
+def profile_reid() -> dict:
+    """Profile ReID (ResNet18) in isolation."""
+    from core.reid import ReIDExtractor
+    r = ReIDExtractor()
+    crop = np.zeros((r.input_size, r.input_size, 3), dtype=np.uint8)
+
+    def fn():
+        r.extract(crop)
+        return _gpu_stats()
+
+    res = _peak(fn)
+    res["model"] = "resnet18 (ReID, FP16)"
+    res["imgsz"] = r.input_size
+    res["half"] = r.half
+    del r
+    gc.collect()
+    import torch
+    torch.cuda.empty_cache()
+    return res
+
+
+def profile_face() -> dict:
+    """Profile face recognition (insightface buffalo_s) in isolation."""
+    from core.face import FaceRecognizer
+    import torch
+    f = FaceRecognizer()
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    def fn():
+        f.detect_and_embed(frame)
+        return _gpu_stats()
+
+    res = _peak(fn)
+    res["model"] = "buffalo_s (SCRFD-500M + MobileFaceNet)"
+    res["det_size"] = f.det_size
+    res["dim"] = f.dim
+    del f
+    gc.collect()
+    torch.cuda.empty_cache()
+    return res
+
+
 def profile_all() -> list[dict]:
     # Each phase adds an entry here.
     return [
         profile_detector(),
         profile_pose(),
+        profile_reid(),
+        profile_face(),
     ]
 
 

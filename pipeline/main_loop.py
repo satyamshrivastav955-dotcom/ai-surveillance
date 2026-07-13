@@ -15,7 +15,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from core.config import load_pipeline_config
+from core.config import load_pipeline_config, load_models_config
 from core.detector import Detector
 from core.tracker import Tracker
 from core.video_source import VideoSource, build_source
@@ -156,6 +156,32 @@ def run(config_path: str | None = None) -> None:
         print("[phase2] WARN fall_detection enabled but pose disabled — "
               "FallDetector will never receive poses.")
 
+    # Phase 3: ReID + face recognition + identity fusion.
+    # All gated by FrameRouter + features config (constraint #6).
+    models_cfg = load_models_config()
+    reid_mgr = None
+    face_rec = None
+    identity_mgr = None
+    if features.get("reid") and router.is_enabled("reid"):
+        from core.reid import ReIDExtractor, ReIDManager, ReIDIndex
+        reid_ext = ReIDExtractor(models_cfg)
+        reid_idx = ReIDIndex(models_cfg)
+        reid_mgr = ReIDManager(reid_ext, reid_idx, models_cfg)
+        print(f"[phase3] reid enabled  model={models_cfg.get('reid', {}).get('model', 'resnet18')} "
+              f"dim={reid_ext.input_size} every={router.every('reid')}")
+    if features.get("face") and router.is_enabled("face"):
+        from core.face import FaceRecognizer
+        face_rec = FaceRecognizer(models_cfg)
+        # load the persistent face index if it exists
+        idx_path = models_cfg.get("face", {}).get("index_path", "models/face_index")
+        face_rec.load_index(idx_path)
+        print(f"[phase3] face enabled  pack={models_cfg.get('face', {}).get('model_pack', 'buffalo_s')} "
+              f"enrolled={len(face_rec._labels)} every={router.every('face')}")
+    if features.get("identity_fusion") and (reid_mgr is not None or face_rec is not None):
+        from core.identity import IdentityManager
+        identity_mgr = IdentityManager()
+        print("[phase3] identity fusion enabled")
+
     # --- source -----------------------------------------------------------
     source: VideoSource = build_source(src_cfg)
     source.open()
@@ -185,7 +211,7 @@ def run(config_path: str | None = None) -> None:
     fps_window_n = 0
     last_vram_log = last_t
 
-    print(f"[phase2] router={router}  source={src_cfg.get('type')}  "
+    print(f"[phase3] router={router}  source={src_cfg.get('type')}  "
           f"imgsz={detector.imgsz} half={detector.half} device={detector.device}")
 
     try:
@@ -193,7 +219,7 @@ def run(config_path: str | None = None) -> None:
             ok, frame = source.read()
             if not ok or frame is None:
                 # file EOF with loop=False or camera gone — bail
-                print("[phase2] source ended (no frame).")
+                print("[phase3] source ended (no frame).")
                 break
 
             # --- pipeline stages: all gated by the FrameRouter --------------
@@ -227,10 +253,72 @@ def run(config_path: str | None = None) -> None:
                         print(f"[phase2] FALL id={ev.track_id} "
                               f"frame={ev.frame_idx} aspect={ev.aspect_now:.2f}")
 
+            # --- Phase 3: ReID + face recognition + identity fusion ---
+            identity_events = []
+            if reid_mgr is not None and router.should_run("reid", frame_idx):
+                relinks = reid_mgr.on_tracks_updated(frame, tracks)
+                for m in relinks:
+                    if m.matched_track_id is not None:
+                        print(f"[phase3] REID re-link: track {m.new_track_id} "
+                              f"-> lost track {m.matched_track_id} "
+                              f"(sim={m.similarity:.2f})")
+                    if identity_mgr is not None:
+                        ev = identity_mgr.on_reid_relink(m)
+                        if ev:
+                            identity_events.append(ev)
+                            print(f"[phase3] IDENTITY: track {ev.track_id} "
+                                  f"= '{ev.label}' (via {ev.source})")
+
+            if face_rec is not None and router.should_run("face", frame_idx):
+                for tr in tracks:
+                    if getattr(tr, "cls", -1) != 0:
+                        continue
+                    tid = getattr(tr, "track_id", -1)
+                    if tid < 0:
+                        continue
+                    x1, y1, x2, y2 = tr.xyxy
+                    fx1 = max(0, int(x1)); fy1 = max(0, int(y1))
+                    fx2 = min(frame.shape[1], int(x2)); fy2 = min(frame.shape[0], int(y2))
+                    if fx2 - fx1 < 32 or fy2 - fy1 < 32:
+                        continue
+                    crop = frame[fy1:fy2, fx1:fx2]
+                    matches = face_rec.process_person_crop(crop, (fx1, fy1), tid)
+                    for fm in matches:
+                        if fm.name is not None:
+                            print(f"[phase3] FACE: track {tid} = '{fm.name}' "
+                                  f"(sim={fm.similarity:.2f})")
+                        if identity_mgr is not None:
+                            ev = identity_mgr.on_face_match(fm)
+                            if ev:
+                                identity_events.append(ev)
+                                # propagate the face-confirmed identity to the ReID index
+                                if reid_mgr is not None:
+                                    reid_mgr.set_label(tid, ev.label)
+                                print(f"[phase3] IDENTITY: track {ev.track_id} "
+                                      f"= '{ev.label}' (via {ev.source})")
+
             # --- display ----------------------------------------------------
             if disp.get("enabled", True):
                 vis = frame
-                _draw_tracks(vis, tracks)
+                # draw tracks with identity labels if available
+                for t in tracks:
+                    x1, y1, x2, y2 = t.xyxy
+                    c = _color_for(t.track_id)
+                    cv2.rectangle(vis, (x1, y1), (x2, y2), c, 2)
+                    # build label: track ID + class + identity if known
+                    label_parts = [f"id{t.track_id}"]
+                    if 0 <= t.cls < len(COCO_NAMES):
+                        label_parts.append(COCO_NAMES[t.cls])
+                    if identity_mgr is not None:
+                        lbl = identity_mgr.get_label(t.track_id)
+                        if lbl:
+                            label_parts.append(lbl)
+                    label_parts.append(f"{t.conf:.2f}")
+                    label = " ".join(label_parts)
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    cv2.rectangle(vis, (x1, max(0, y1 - th - 4)), (x1 + tw + 4, y1), c, -1)
+                    cv2.putText(vis, label, (x1 + 2, max(th, y1 - 2)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 if poses:
                     _draw_pose(vis, poses)
                 if fall_events:
@@ -248,11 +336,13 @@ def run(config_path: str | None = None) -> None:
                     hud.append(f"p:{len(poses)}")
                 if fall_events:
                     hud.append("FALL!")
+                if identity_events:
+                    hud.append("ID!")
                 cv2.putText(vis, " | ".join(hud), (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.imshow(win, vis)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):  # q or ESC
-                    print("[phase2] quit requested.")
+                    print("[phase3] quit requested.")
                     break
 
             # --- perf bookkeeping ------------------------------------------
@@ -263,7 +353,7 @@ def run(config_path: str | None = None) -> None:
                 fps_window_t = now
                 fps_window_n = 0
                 if fps < fps_warn:
-                    print(f"[phase2] WARN fps={fps:.1f} below target {fps_warn}")
+                    print(f"[phase3] WARN fps={fps:.1f} below target {fps_warn}")
 
             if vram_writer is not None and (now - last_vram_log) >= vram_log_every:
                 alloc = _vram_mb()
@@ -276,18 +366,18 @@ def run(config_path: str | None = None) -> None:
                 vram_file.flush()
                 last_vram_log = now
                 if alloc / 1024.0 > vram_warn_gb:
-                    print(f"[phase2] WARN VRAM {alloc}MB exceeds {vram_warn_gb}GB budget")
+                    print(f"[phase3] WARN VRAM {alloc}MB exceeds {vram_warn_gb}GB budget")
 
             frame_idx += 1
     except KeyboardInterrupt:
-        print("[phase2] interrupted.")
+        print("[phase3] interrupted.")
     finally:
         source.release()
         if disp.get("enabled", True):
             cv2.destroyAllWindows()
         if vram_file is not None:
             vram_file.close()
-        print(f"[phase2] done. frames={frame_idx} final_fps={fps:.1f} "
+        print(f"[phase3] done. frames={frame_idx} final_fps={fps:.1f} "
               f"vram_alloc={_vram_mb()}MB reserved={_vram_reserved_mb()}MB")
 
 

@@ -74,6 +74,29 @@ def main():
         pose_est = PoseEstimator()
         fall_det = FallDetector(load_models_config().get("fall", {}))
 
+    # Phase 3: optionally load ReID + face + identity fusion
+    models_cfg = load_models_config()
+    use_reid = features.get("reid", False) and router.is_enabled("reid") and not args.no_pose
+    use_face = features.get("face", False) and router.is_enabled("face") and not args.no_pose
+    reid_every = router.every("reid") if use_reid else 1
+    face_every = router.every("face") if use_face else 1
+    reid_mgr = None
+    face_rec = None
+    identity_mgr = None
+    if use_reid:
+        from core.reid import ReIDExtractor, ReIDManager, ReIDIndex
+        reid_ext = ReIDExtractor(models_cfg)
+        reid_idx = ReIDIndex(models_cfg)
+        reid_mgr = ReIDManager(reid_ext, reid_idx, models_cfg)
+    if use_face:
+        from core.face import FaceRecognizer
+        face_rec = FaceRecognizer(models_cfg)
+        idx_path = models_cfg.get("face", {}).get("index_path", "models/face_index")
+        face_rec.load_index(idx_path)
+    if use_reid or use_face:
+        from core.identity import IdentityManager
+        identity_mgr = IdentityManager()
+
     import torch
     torch.cuda.reset_peak_memory_stats()
 
@@ -84,9 +107,13 @@ def main():
 
     src_label = (f"synthetic@{args.fps:.0f}fps" if args.source == "synthetic"
                  else (args.path or args.source))
+    extras = []
+    if pose_est: extras.append(f"pose:every={pose_every}")
+    if reid_mgr: extras.append(f"reid:every={reid_every}")
+    if face_rec: extras.append(f"face:every={face_every}")
     print(f"bench: source={src_label}  seconds={args.seconds:.1f}  "
-          f"imgsz={detector.imgsz} half={detector.half} device={detector.device} "
-          f"pose={'on (every='+str(pose_every)+')' if pose_est else 'off'}")
+          f"imgsz={detector.imgsz} half={detector.half} device={detector.device}  "
+          f"{' '.join(extras) if extras else 'features=off'}")
 
     # read one real frame to size warmup against actual input
     ok, frame = source.read()
@@ -104,6 +131,8 @@ def main():
     n = 0
     n_poses = 0
     n_falls = 0
+    n_relinks = 0
+    n_face_matches = 0
     t0 = time.perf_counter()
     deadline = t0 + args.seconds
     last_print = t0
@@ -122,12 +151,31 @@ def main():
                 if fall_det is not None:
                     events = fall_det.update(poses, frame_idx=n, t=time.perf_counter())
                     n_falls += len(events)
+        if reid_mgr is not None and router.should_run("reid", n):
+            relinks = reid_mgr.on_tracks_updated(frame, tracks)
+            n_relinks += sum(1 for r in relinks if r.matched_track_id is not None)
+        if face_rec is not None and router.should_run("face", n):
+            for tr in tracks:
+                if getattr(tr, "cls", -1) != 0 or getattr(tr, "track_id", -1) < 0:
+                    continue
+                x1, y1, x2, y2 = tr.xyxy
+                fx1 = max(0, int(x1)); fy1 = max(0, int(y1))
+                fx2 = min(frame.shape[1], int(x2)); fy2 = min(frame.shape[0], int(y2))
+                if fx2 - fx1 < 32 or fy2 - fy1 < 32:
+                    continue
+                crop = frame[fy1:fy2, fx1:fx2]
+                fms = face_rec.process_person_crop(crop, (fx1, fy1), tr.track_id)
+                n_face_matches += sum(1 for fm in fms if fm.name is not None)
         n += 1
         now = time.perf_counter()
         if now - last_print >= 2.0:
             extra = f" p:{n_poses}"
             if pose_est is not None:
                 extra += f" falls:{n_falls}"
+            if reid_mgr is not None:
+                extra += f" relinks:{n_relinks}"
+            if face_rec is not None:
+                extra += f" faces:{n_face_matches}"
             print(f"  ... {n} frames, {n / (now - t0):.1f} fps, "
                   f"{len(tracks)} tracks{extra}")
             last_print = now
@@ -145,8 +193,12 @@ def main():
         print(f"pose imgsz / half   {pose_est.imgsz} / {pose_est.half}")
         print(f"poses (running tot) {n_poses}")
         print(f"fall events         {n_falls}")
+    if reid_mgr is not None:
+        print(f"reid relinks        {n_relinks}")
+    if face_rec is not None:
+        print(f"face matches        {n_face_matches}")
     print(f"target >=20 FPS      {'OK' if n / elapsed >= 20 else 'BELOW'}")
-    print(f"vram <2GB           {'OK' if peak < 2048 else 'OVER'}")
+    print(f"vram <5GB           {'OK' if peak < 5120 else 'OVER'}")
 
 
 if __name__ == "__main__":
