@@ -1,9 +1,9 @@
-"""Phase 1 main loop: capture -> detect -> track -> draw -> display.
+"""Phase 2 main loop: capture -> detect -> track -> [pose -> fall] -> display.
 
-No other models run here yet. The loop logs FPS and VRAM continuously and
-writes a VRAM CSV sample every `perf.vram_log_every_s` seconds, so the
-Phase 1 success criteria (>=20 FPS @ 640x640, <2GB VRAM) can be verified
-without any extra tooling.
+Phase 1's pipeline stays intact (single shared YOLO detector, ByteTrack on
+top). Phase 2 adds the *optional* pose stage, gated by FrameRouter and
+toggleable from configs/pipeline.yaml — pose runs on person crops only and
+feeds the rule-based fall detector. Phases 3+ will plug in the same way.
 """
 from __future__ import annotations
 
@@ -58,6 +58,43 @@ def _draw_tracks(frame: np.ndarray, tracks) -> None:
         cv2.putText(frame, label, (x1 + 2, max(th, y1 - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
 
+# COCO-pose keypoint skeleton pairs for visualization (indices, see core/pose.py)
+_POSE_SKELETON = [
+    (0, 1), (0, 2), (1, 3), (2, 4),       # face
+    (5, 6), (5, 11), (6, 12), (11, 12),  # torso
+    (5, 7), (7, 9), (6, 8), (8, 10),      # arms
+    (11, 13), (13, 15), (12, 14), (14, 16),  # legs
+]
+_KPT_COLOR = (0, 255, 255)
+_SKELETON_COLOR = (255, 255, 0)
+
+
+def _draw_pose(frame: np.ndarray, poses) -> None:
+    """Draw keypoints + skeleton for one frame's poses (already remapped to full-frame coords)."""
+    for p in poses:
+        k = p.keypoints
+        # lines first so dots land on top
+        for a, b in _POSE_SKELETON:
+            xa, ya, ca = k[a]
+            xb, yb, cb = k[b]
+            if ca > 0.3 and cb > 0.3:
+                cv2.line(frame, (int(xa), int(ya)), (int(xb), int(yb)),
+                         _SKELETON_COLOR, 1)
+        for x, y, c in k:
+            if c > 0.3:
+                cv2.circle(frame, (int(x), int(y)), 3, _KPT_COLOR, -1)
+
+
+def _draw_falls(frame: np.ndarray, fall_events) -> None:
+    """Big red FALL label per event so it's visible on the live display."""
+    for ev in fall_events:
+        cx = 50
+        cy = 60 + 30 * ev.track_id % 5
+        cv2.rectangle(frame, (cx, cy - 20), (cx + 240, cy + 5), (0, 0, 128), -1)
+        cv2.putText(frame, f"FALL id{ev.track_id} f{ev.frame_idx}",
+                    (cx + 5, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+
 def _vram_mb() -> int:
     try:
         import torch
@@ -96,6 +133,29 @@ def run(config_path: str | None = None) -> None:
     detector = Detector()
     tracker = Tracker(detector)
 
+    # Phase 2: pose + fall detector. Only constructed if enabled in features
+    # AND the FrameRouter stage is enabled — defensive double-check so a stale
+    # config can't load a heavy model then never run it.
+    features = cfg.get("features", {})
+    pose_est = None
+    fall_det = None
+    if features.get("pose") and router.is_enabled("pose"):
+        from core.pose import PoseEstimator
+        from core.state_machine import FallDetector
+        pose_est = PoseEstimator()
+        fall_cfg = (load_pipeline_config() if config_path is None else _load_extra(config_path))
+        # fall thresholds live in models.yaml, not pipeline.yaml
+        from core.config import load_models_config
+        fall_det = FallDetector(load_models_config().get("fall", {}))
+        print(f"[phase2] pose enabled  imgsz={pose_est.imgsz} half={pose_est.half}")
+    if features.get("fall_detection") and fall_det is None:
+        # fall_detection feature without pose is meaningless — warn loudly
+        from core.state_machine import FallDetector
+        from core.config import load_models_config
+        fall_det = FallDetector(load_models_config().get("fall", {}))
+        print("[phase2] WARN fall_detection enabled but pose disabled — "
+              "FallDetector will never receive poses.")
+
     # --- source -----------------------------------------------------------
     source: VideoSource = build_source(src_cfg)
     source.open()
@@ -125,7 +185,7 @@ def run(config_path: str | None = None) -> None:
     fps_window_n = 0
     last_vram_log = last_t
 
-    print(f"[phase1] router={router}  source={src_cfg.get('type')}  "
+    print(f"[phase2] router={router}  source={src_cfg.get('type')}  "
           f"imgsz={detector.imgsz} half={detector.half} device={detector.device}")
 
     try:
@@ -133,7 +193,7 @@ def run(config_path: str | None = None) -> None:
             ok, frame = source.read()
             if not ok or frame is None:
                 # file EOF with loop=False or camera gone — bail
-                print("[phase1] source ended (no frame).")
+                print("[phase2] source ended (no frame).")
                 break
 
             # --- pipeline stages: all gated by the FrameRouter --------------
@@ -150,10 +210,31 @@ def run(config_path: str | None = None) -> None:
                     for d in detector.detect(frame)
                 ]
 
+            # --- Phase 2: pose on person crops, then fall state machine ---
+            poses = []
+            fall_events = []
+            if pose_est is not None and router.should_run("pose", frame_idx):
+                # Run pose only on person-class tracks (COCO cls == 0). If the
+                # detector was configured with classes=null and the scene has
+                # /no/ persons, this is empty — pose simply doesn't fire that
+                # frame, which is the VRAM/compute win we want.
+                person_tracks = [t for t in tracks if getattr(t, "cls", -1) == 0]
+                poses = pose_est.estimate_crops(frame, person_tracks)
+                if fall_det is not None:
+                    fall_events = fall_det.update(
+                        poses, frame_idx=frame_idx, t=time.perf_counter())
+                    for ev in fall_events:
+                        print(f"[phase2] FALL id={ev.track_id} "
+                              f"frame={ev.frame_idx} aspect={ev.aspect_now:.2f}")
+
             # --- display ----------------------------------------------------
             if disp.get("enabled", True):
                 vis = frame
                 _draw_tracks(vis, tracks)
+                if poses:
+                    _draw_pose(vis, poses)
+                if fall_events:
+                    _draw_falls(vis, fall_events)
                 if resize_w and vis.shape[1] != resize_w:
                     scale = resize_w / vis.shape[1]
                     vis = cv2.resize(vis, (resize_w, int(vis.shape[0] * scale)))
@@ -163,11 +244,15 @@ def run(config_path: str | None = None) -> None:
                 if show_vram:
                     hud.append(f"VRAM:{_vram_mb()}MB/{_vram_reserved_mb()}MB")
                 hud.append(f"f:{frame_idx} n:{len(tracks)}")
+                if pose_est is not None:
+                    hud.append(f"p:{len(poses)}")
+                if fall_events:
+                    hud.append("FALL!")
                 cv2.putText(vis, " | ".join(hud), (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.imshow(win, vis)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):  # q or ESC
-                    print("[phase1] quit requested.")
+                    print("[phase2] quit requested.")
                     break
 
             # --- perf bookkeeping ------------------------------------------
@@ -178,7 +263,7 @@ def run(config_path: str | None = None) -> None:
                 fps_window_t = now
                 fps_window_n = 0
                 if fps < fps_warn:
-                    print(f"[phase1] WARN fps={fps:.1f} below target {fps_warn}")
+                    print(f"[phase2] WARN fps={fps:.1f} below target {fps_warn}")
 
             if vram_writer is not None and (now - last_vram_log) >= vram_log_every:
                 alloc = _vram_mb()
@@ -191,18 +276,18 @@ def run(config_path: str | None = None) -> None:
                 vram_file.flush()
                 last_vram_log = now
                 if alloc / 1024.0 > vram_warn_gb:
-                    print(f"[phase1] WARN VRAM {alloc}MB exceeds {vram_warn_gb}GB budget")
+                    print(f"[phase2] WARN VRAM {alloc}MB exceeds {vram_warn_gb}GB budget")
 
             frame_idx += 1
     except KeyboardInterrupt:
-        print("[phase1] interrupted.")
+        print("[phase2] interrupted.")
     finally:
         source.release()
         if disp.get("enabled", True):
             cv2.destroyAllWindows()
         if vram_file is not None:
             vram_file.close()
-        print(f"[phase1] done. frames={frame_idx} final_fps={fps:.1f} "
+        print(f"[phase2] done. frames={frame_idx} final_fps={fps:.1f} "
               f"vram_alloc={_vram_mb()}MB reserved={_vram_reserved_mb()}MB")
 
 

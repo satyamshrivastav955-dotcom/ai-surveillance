@@ -6,20 +6,64 @@
 
 detector:
   name: yolov8n
-  weights: models/yolov8n.pt          # auto-downloaded by ultralytics on first run (~6MB)
+  runtime: pytorch                   # pytorch (default — ultralytics NMS wins on detector-only)
+                                        # onnx_direct available if needed; onnx via ultralytics also OK
+  weights: models/yolov8n.pt            # PyTorch weights (source for export; also used when runtime=pytorch)
+  onnx: models/yolov8n.onnx             # FP16 ONNX export (produced by tools/export_onnx.py)
   imgsz: 640                           # 640x640 keeps VRAM low; 960x540 is the upscale-if-needed fallback
   half: true                           # FP16 on CUDA — see hardware budget Section 1
   device: cuda:0
   conf: 0.35
   iou: 0.5
-  classes: null                        # null = all classes; restrict later to [0] for persons-only where useful
+  classes: [0]                          # persons-only — security-camera use case; saves NMS + downstream cost
 
-# --- Phase 2+ stubs (uncomment / fill when their phase is built) ---
-# pose:
-#   weights: models/yolov8n-pose.pt
-#   imgsz: 640
-#   half: true
-#   device: cuda:0
+# --- Phase 2: pose for fall detection ---
+# Runs only on person crops from the tracker's boxes, never full frame.
+# Same ultralytics family -> same optimizations, single warmup.
+pose:
+  name: yolov8n-pose
+  runtime: onnx_direct               # onnx_direct (default — bypasses ultralytics wrapper; ~44% lower overhead)
+                                        # pytorch available as rollback if any accuracy regression
+  weights: models/yolov8n-pose.pt      # PyTorch weights
+  onnx: models/yolov8n-pose.onnx       # FP16 ONNX export
+  imgsz: 160                           # crop-only pose: 160 is small enough that overhead is dominated by model, not letterbox
+  half: true                           # FP16 on CUDA
+  device: cuda:0
+  conf: 0.25                           # lower than detector — pose on a tight crop is harder
+
+# --- Phase 2: fall-detection state machine thresholds ---
+# Tuned against real-webcam false-trigger data. The previous values
+# (aspect_threshold=1.0, kp_height_frac=0.60, no min_upright_s) fired every
+# 4-7 seconds during normal sitting/standing/leaning because:
+#   - aspect 1.0-1.2 (slightly crouched) was being classified "horizontal"
+#   - sitting puts hips at ~0.55-0.65 of bbox height, below the old 0.60 threshold
+#   - a single upright frame during fidgeting re-armed the trigger, so after
+#     cooldown the next slightly-horizontal frame fired again
+# New values:
+fall:
+  aspect_threshold: 1.5               # bbox w/h above this = "horizontal"
+                                        # standing ~0.4, sitting ~0.8-1.2,
+                                        # leaning-forward ~1.0-1.3,
+                                        # genuine lying-flat fall ~1.5-2.0+
+  keypoint_height_frac: 0.75          # hip/shoulder y at or below this fraction
+                                        # of bbox height = "low"
+                                        # standing shoulders ~0.05, hips ~0.5;
+                                        # sitting hips ~0.55-0.65 (below old 0.60);
+                                        # lying-flat ~0.85-0.95
+  transition_window_s: 1.5            # UPRIGHT -> FALLEN must complete within this
+                                        # to count as a fall (filters slow sit-down)
+  cooldown_s: 5.0                      # after a FALL event, suppress re-trigger for this long
+  min_upright_s: 1.0                   # NEW: track must be continuously upright for
+                                        # at least this long before being eligible to
+                                        # fire a fall. A single upright frame during
+                                        # fidgeting no longer re-arms the trigger.
+  min_conf: 0.30                       # ignore keypoints below this confidence
+
+# Debug: set env FALL_DEBUG=1 to log the next 10 triggers + suppressed
+# would-triggers with full signal breakdown (aspect, kp_frac, upright_dur,
+# delta). Useful for tuning. Cap via FALL_DEBUG_LIMIT=N.
+
+# --- Phase 3+ stubs (uncomment / fill when their phase is built) ---
 # reid:
 #   weights: models/osnet_x0_25.pt     # OSNet-x0.25 is the lightest ReID
 #   device: cuda:0

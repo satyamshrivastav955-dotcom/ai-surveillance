@@ -12,14 +12,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def _fire_sigint():
-    time.sleep(8.0)
+    time.sleep(15.0)
     print("\n[test_runner] raising SIGINT on main thread", flush=True)
     signal.raise_signal(signal.SIGINT)
 
 
 def main():
     threading.Thread(target=_fire_sigint, daemon=True).start()
-    print("[test_runner] starting main_loop; SIGINT will fire in 8s", flush=True)
+    print("[test_runner] starting main_loop; SIGINT will fire in 15s", flush=True)
     import pipeline.main_loop as m
     m.run()
 

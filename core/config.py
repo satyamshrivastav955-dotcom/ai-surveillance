@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,9 @@ import yaml
 logging.getLogger("ultralytics").addFilter(
     lambda r: "'half' is deprecated" not in r.getMessage()
 )
+# pynvml (used by phase2_static_bench for VRAM in onnx_direct mode) emits a
+# FutureWarning on import. Silence it for the same reason.
+warnings.filterwarnings("ignore", message=".*The pynvml package is deprecated.*")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "configs"
