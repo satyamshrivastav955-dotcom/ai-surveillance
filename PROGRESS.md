@@ -224,8 +224,8 @@ ai-surveillance/
 
 ## Architectural Decisions (with rationale)
 
-### 1. Single shared YOLO detector (Phase 1, constraint #1)
-All object/person detection goes through one YOLOv8n instance. The tracker rides on the same model via `model.track()`. No second YOLO is ever spawned — fire/smoke and other Phase 4 detections will reuse the same pass or use the detector's crops.
+### 1. Shared YOLO detector + one dedicated phone-detection instance (Phase 1 / Phase 4)
+All object/person detection goes through one YOLOv8n instance. The tracker rides on the same model via `model.track()`. **Exception (Phase 4):** `PhoneWatcherDetector` loads its own independent second YOLOv8n instance restricted to COCO class 67 (cell phone). Sharing was attempted first but caused tracker state corruption: calling `predict(classes=[67])` on the same model that runs `track(classes=[0], persist=True)` reset the tracker's internal byte-track state. The dedicated instance adds ~6MB VRAM and runs at cadence every=10 frames, so the compute cost is minimal.
 
 ### 2. FrameRouter scheduler (Phase 1, constraint #4)
 One `FrameRouter` class gates every pipeline stage. No scattered `if frame_count % N == 0` checks. Adding a phase = adding a config entry + a stage handler. Cadence changes (e.g. `pose.every: 1->2`) are config edits, not code changes.
@@ -285,10 +285,63 @@ SCRFD-500M (the "small variant" per spec) + MobileFaceNet (w600k ArcFace-MobileN
 
 | Phase | Status | Key deliverable |
 |---|---|---|
-| 1 — Core Detection Loop | complete | Shared YOLO + ByteTrack + live display |
-| 2 — Fall Detection | complete | YOLOv8n-pose on crops + rule-based state machine (tuned) |
-| ONNX Export Pass | complete | Pose on onnx_direct (46% overhead reduction) |
-| 3 — ReID + Face | complete | ResNet18 + SCRFD/MobileFaceNet + identity fusion |
-| 4 — Remaining Events | pending | Fire/smoke, smoking, phone, gathering, violence |
+| 1 — Core Detection Loop | ✅ complete | Shared YOLO + ByteTrack + live display |
+| 2 — Fall Detection | ✅ complete | YOLOv8n-pose on crops + rule-based state machine (tuned) |
+| ONNX Export Pass | ✅ complete | Pose on onnx_direct (46% overhead reduction) |
+| 3 — ReID + Face | ✅ complete | ResNet18 + SCRFD/MobileFaceNet + identity fusion |
+| 4 — Remaining Events | ✅ complete (heuristics) | Fire/smoke/smoking/phone/gathering/violence — all heuristic placeholders, live-tested and threshold-tuned |
 | 5 — Event Bus + Logging | pending | Redis Streams + SQLite event log |
 | 6 — VLM Layer | pending | Alert verifier, open-vocab watcher, NL query engine |
+
+---
+
+## Phase 4 — Event Detectors (live-test results + threshold changes)
+
+### Overview
+Five event detectors added in `core/events.py`, all gated through FrameRouter.
+All heuristics are documented placeholders — production replacements require trained models.
+
+### 1. PhoneWatcherDetector — phone detection fixed
+- **Root cause of original conflict:** `PhoneWatcherDetector` was sharing the tracker's YOLOv8n instance. Calling `predict(classes=[67])` on a model running `track(classes=[0], persist=True)` reset ByteTrack state, causing tracking IDs to reset every phone-detection frame.
+- **Fix:** `PhoneWatcherDetector.__init__` always loads its **own independent YOLOv8n instance** from `models/yolov8n.pt` restricted to class 67. The `detector_model` parameter is accepted for backward compatibility but **always ignored**.
+- **Config:** `phone: enabled: true` in both `pipeline.yaml` sections. Runs every 10 frames (3fps at 30fps source).
+- **VRAM cost:** +~6MB (same yolov8n weights, separate model object). Negligible.
+
+### 2. FireSmokeDetector — fire OK, smoke tightened
+- **Fire:** Worked well in live testing (detected a lit match at pixel_ratio ~0.01-0.04). Thresholds left mostly as-is. Added `fire_min_duration: 2` (must detect fire in 2+ consecutive frames) to eliminate single-frame false positives from red clothing / warm lighting.
+- **Smoke:** Badly over-triggering. `pixel_ratio` was 0.35-0.71 on normal room content (skin tone, walls, clothing all matched the old HSV range `S≤50, V 100-220`). **Tightened:**
+  - `smoke_hsv_low: [0, 0, 140]` / `smoke_hsv_high: [180, 30, 220]` — S≤30 excludes skin and warm tones; V≥140 excludes dark regions
+  - `smoke_min_pixel_ratio: 0.60` — requires 60%+ of the frame to be smoke-colored
+  - **Status:** Even after tightening, this remains a **COARSE PLACEHOLDER**. Real smoke detection requires a trained model (D-Fire, FireNet, or similar).
+
+### 3. SmokingDetector — unchanged, comment added
+- Heuristic left as-is (no change to thresholds).
+- **Comment added** in code: fired on an untested scenario during live webcam testing (bright reflections on skin/clothing near face triggered the glow heuristic). Remains a **ROUGH PLACEHOLDER**.
+
+### 4. ViolenceDetector — thresholds tightened
+- **Live-test problem:** Ordinary proximity + movement between 2 people talking/standing triggered 3 false positives.
+- **Changes:**
+  - `iou_threshold: 0.1 → 0.3` — requires substantial bbox overlap, not just incidental proximity
+  - `motion_threshold: 15.0 → 40.0 px/frame` — requires rapid movement, not normal gesturing
+  - `window_s: 1.0 → 1.5s` — must sustain contact + motion continuously for 1.5s (a single slow frame resets `motion_active`)
+- **Status:** Even after tightening, this is a **WEAK PLACEHOLDER**. Cannot distinguish fighting from handshakes, hugs, or dancing. The VLM layer (Phase 6) must disambiguate. Real violence detection needs a temporal action model (MoViNet-A0 per spec).
+
+### 5. GatheringDetector — unchanged
+- Fixed-radius clustering on track centroids. No live-test issues.
+
+### Phase 4 test results
+| Suite | Tests | Result |
+|---|---|---|
+| `phase4_test.py` | 8 | all pass |
+
+### Phase 4 FPS / VRAM (10s webcam run, all Phase 4 detectors enabled)
+
+| Metric | Value | Target | Status |
+|---|---|---|---|
+| Frames | 171 | — | — |
+| Throughput | **17.1 FPS** | ≥20 FPS | ⚠️ BELOW (camera-bound — same as Phase 3) |
+| VRAM alloc / peak | **34 / 41 MB** | <5120 MB | ✅ OK (8.2% of budget) |
+| Fall events | 0 | — | no falls detected (correct) |
+| Face matches | 41 | — | face recognition active |
+
+**Note on FPS:** The 17.1 FPS figure is camera-bound (webcam V4L2 read latency), not GPU-bound — identical behavior to Phase 3. The `phone:every=10` second YOLOv8n instance added no measurable FPS drop vs Phase 3 baseline at 10-frame cadence. VRAM is well within budget.

@@ -97,6 +97,29 @@ def main():
         from core.identity import IdentityManager
         identity_mgr = IdentityManager()
 
+    # Phase 4: fire/smoke, smoking, phone, gathering, violence
+    fire_smoke_det = None
+    smoking_det = None
+    phone_det = None
+    gathering_det = None
+    violence_det = None
+    if features.get("fire_smoke") and router.is_enabled("fire_smoke") and not args.no_pose:
+        from core.events import FireSmokeDetector
+        fire_smoke_det = FireSmokeDetector(models_cfg.get("fire_smoke", {}))
+    if features.get("smoking") and router.is_enabled("smoking") and not args.no_pose:
+        from core.events import SmokingDetector
+        smoking_det = SmokingDetector(models_cfg.get("smoking", {}))
+    if features.get("phone") and router.is_enabled("phone") and not args.no_pose:
+        from core.events import PhoneWatcherDetector
+        phone_det = PhoneWatcherDetector(models_cfg.get("phone", {}),
+                                         detector_model=detector.model)
+    if features.get("gathering") and router.is_enabled("gathering") and not args.no_pose:
+        from core.events import GatheringDetector
+        gathering_det = GatheringDetector(models_cfg.get("gathering", {}))
+    if features.get("violence") and router.is_enabled("violence") and not args.no_pose:
+        from core.events import ViolenceDetector
+        violence_det = ViolenceDetector(models_cfg.get("violence", {}))
+
     import torch
     torch.cuda.reset_peak_memory_stats()
 
@@ -111,6 +134,10 @@ def main():
     if pose_est: extras.append(f"pose:every={pose_every}")
     if reid_mgr: extras.append(f"reid:every={reid_every}")
     if face_rec: extras.append(f"face:every={face_every}")
+    if fire_smoke_det: extras.append(f"fire_smoke:every={router.every('fire_smoke')}")
+    if phone_det: extras.append(f"phone:every={router.every('phone')}")
+    if gathering_det: extras.append(f"gathering:every={router.every('gathering')}")
+    if violence_det: extras.append(f"violence:every={router.every('violence')}")
     print(f"bench: source={src_label}  seconds={args.seconds:.1f}  "
           f"imgsz={detector.imgsz} half={detector.half} device={detector.device}  "
           f"{' '.join(extras) if extras else 'features=off'}")
@@ -166,6 +193,17 @@ def main():
                 crop = frame[fy1:fy2, fx1:fx2]
                 fms = face_rec.process_person_crop(crop, (fx1, fy1), tr.track_id)
                 n_face_matches += sum(1 for fm in fms if fm.name is not None)
+        # Phase 4 detectors
+        if fire_smoke_det is not None and router.should_run("fire_smoke", n):
+            fire_smoke_det.detect(frame, n)
+        if smoking_det is not None and router.should_run("smoking", n):
+            smoking_det.detect(frame, tracks, n)
+        if phone_det is not None and router.should_run("phone", n):
+            phone_det.detect(frame, tracks, [], n)
+        if gathering_det is not None and router.should_run("gathering", n):
+            gathering_det.detect(tracks, n, t=time.perf_counter())
+        if violence_det is not None and router.should_run("violence", n):
+            violence_det.detect(tracks, n, t=time.perf_counter())
         n += 1
         now = time.perf_counter()
         if now - last_print >= 2.0:

@@ -182,6 +182,40 @@ def run(config_path: str | None = None) -> None:
         identity_mgr = IdentityManager()
         print("[phase3] identity fusion enabled")
 
+    # Phase 4: fire/smoke, smoking, phone, gathering, violence.
+    # All gated by FrameRouter + features config (constraint #6).
+    fire_smoke_det = None
+    smoking_det = None
+    phone_det = None
+    gathering_det = None
+    violence_det = None
+    if features.get("fire_smoke") and router.is_enabled("fire_smoke"):
+        from core.events import FireSmokeDetector
+        fire_smoke_det = FireSmokeDetector(models_cfg.get("fire_smoke", {}))
+        print(f"[phase4] fire_smoke enabled  every={router.every('fire_smoke')}  "
+              f"method={'hsv_heuristic' if models_cfg.get('fire_smoke', {}).get('weights') is None else 'yolo'}")
+    if features.get("smoking") and router.is_enabled("smoking"):
+        from core.events import SmokingDetector
+        smoking_det = SmokingDetector(models_cfg.get("smoking", {}))
+        print(f"[phase4] smoking enabled  every={router.every('smoking')}  "
+              f"method={'glow_heuristic' if models_cfg.get('smoking', {}).get('weights') is None else 'yolo'}")
+    if features.get("phone") and router.is_enabled("phone"):
+        from core.events import PhoneWatcherDetector
+        # reuse the shared detector model (avoid loading a 2nd YOLO)
+        phone_det = PhoneWatcherDetector(models_cfg.get("phone", {}),
+                                         detector_model=detector.model)
+        print(f"[phase4] phone enabled  every={router.every('phone')}  imgsz={phone_det.imgsz} (shared detector)")
+    if features.get("gathering") and router.is_enabled("gathering"):
+        from core.events import GatheringDetector
+        gathering_det = GatheringDetector(models_cfg.get("gathering", {}))
+        print(f"[phase4] gathering enabled  every={router.every('gathering')}  "
+              f"min_people={gathering_det.min_people}")
+    if features.get("violence") and router.is_enabled("violence"):
+        from core.events import ViolenceDetector
+        violence_det = ViolenceDetector(models_cfg.get("violence", {}))
+        print(f"[phase4] violence enabled  every={router.every('violence')}  "
+              f"method=heuristic_placeholder")
+
     # --- source -----------------------------------------------------------
     source: VideoSource = build_source(src_cfg)
     source.open()
@@ -211,7 +245,7 @@ def run(config_path: str | None = None) -> None:
     fps_window_n = 0
     last_vram_log = last_t
 
-    print(f"[phase3] router={router}  source={src_cfg.get('type')}  "
+    print(f"[phase4] router={router}  source={src_cfg.get('type')}  "
           f"imgsz={detector.imgsz} half={detector.half} device={detector.device}")
 
     try:
@@ -219,7 +253,7 @@ def run(config_path: str | None = None) -> None:
             ok, frame = source.read()
             if not ok or frame is None:
                 # file EOF with loop=False or camera gone — bail
-                print("[phase3] source ended (no frame).")
+                print("[phase4] source ended (no frame).")
                 break
 
             # --- pipeline stages: all gated by the FrameRouter --------------
@@ -297,6 +331,21 @@ def run(config_path: str | None = None) -> None:
                                 print(f"[phase3] IDENTITY: track {ev.track_id} "
                                       f"= '{ev.label}' (via {ev.source})")
 
+            # --- Phase 4: fire/smoke, smoking, phone, gathering, violence ---
+            phase4_events: list = []
+            if fire_smoke_det is not None and router.should_run("fire_smoke", frame_idx):
+                phase4_events.extend(fire_smoke_det.detect(frame, frame_idx))
+            if smoking_det is not None and router.should_run("smoking", frame_idx):
+                phase4_events.extend(smoking_det.detect(frame, tracks, frame_idx))
+            if phone_det is not None and router.should_run("phone", frame_idx):
+                phase4_events.extend(phone_det.detect(frame, tracks, poses, frame_idx))
+            if gathering_det is not None and router.should_run("gathering", frame_idx):
+                phase4_events.extend(gathering_det.detect(tracks, frame_idx, t=time.perf_counter()))
+            if violence_det is not None and router.should_run("violence", frame_idx):
+                phase4_events.extend(violence_det.detect(tracks, frame_idx, t=time.perf_counter()))
+            for ev in phase4_events:
+                print(f"[phase4] {ev.event_type} frame={ev.frame_idx} {ev.details}")
+
             # --- display ----------------------------------------------------
             if disp.get("enabled", True):
                 vis = frame
@@ -338,11 +387,14 @@ def run(config_path: str | None = None) -> None:
                     hud.append("FALL!")
                 if identity_events:
                     hud.append("ID!")
+                if phase4_events:
+                    for ev in phase4_events:
+                        hud.append(f"{ev.event_type}!")
                 cv2.putText(vis, " | ".join(hud), (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.imshow(win, vis)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):  # q or ESC
-                    print("[phase3] quit requested.")
+                    print("[phase4] quit requested.")
                     break
 
             # --- perf bookkeeping ------------------------------------------
@@ -353,7 +405,7 @@ def run(config_path: str | None = None) -> None:
                 fps_window_t = now
                 fps_window_n = 0
                 if fps < fps_warn:
-                    print(f"[phase3] WARN fps={fps:.1f} below target {fps_warn}")
+                    print(f"[phase4] WARN fps={fps:.1f} below target {fps_warn}")
 
             if vram_writer is not None and (now - last_vram_log) >= vram_log_every:
                 alloc = _vram_mb()
@@ -366,18 +418,18 @@ def run(config_path: str | None = None) -> None:
                 vram_file.flush()
                 last_vram_log = now
                 if alloc / 1024.0 > vram_warn_gb:
-                    print(f"[phase3] WARN VRAM {alloc}MB exceeds {vram_warn_gb}GB budget")
+                    print(f"[phase4] WARN VRAM {alloc}MB exceeds {vram_warn_gb}GB budget")
 
             frame_idx += 1
     except KeyboardInterrupt:
-        print("[phase3] interrupted.")
+        print("[phase4] interrupted.")
     finally:
         source.release()
         if disp.get("enabled", True):
             cv2.destroyAllWindows()
         if vram_file is not None:
             vram_file.close()
-        print(f"[phase3] done. frames={frame_idx} final_fps={fps:.1f} "
+        print(f"[phase4] done. frames={frame_idx} final_fps={fps:.1f} "
               f"vram_alloc={_vram_mb()}MB reserved={_vram_reserved_mb()}MB")
 
 

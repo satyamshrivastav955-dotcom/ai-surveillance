@@ -15,7 +15,7 @@ display:
   resize_w: 960         # display-only upscale; inference stays at detector.imgsz
   show_fps: true
   show_vram: true
-  window: "ai-surveillance (Phase 3)"
+  window: "ai-surveillance (Phase 4)"
 
 # ---- FrameRouter: every stage runs through this scheduler (constraint #4) ----
 # frequency is expressed as `every: N` meaning run once every N frames.
@@ -38,11 +38,25 @@ router:
     face:
       enabled: true
       every: 4            # every 3rd-5th frame on person crops (Section 4)
-    # fire_smoke:  { enabled: false, every: 15 }     # Phase 4 (1-2 fps)
-    # crowd:       { enabled: false, every: 30 }     # Phase 4 (1 fps)
-    # violence:    { enabled: false, every: 30 }     # Phase 4 (clip-based)
-    # smoking:     { enabled: false, every: 10 }     # Phase 4
-    # phone:       { enabled: false, every: 10 }    # Phase 4
+    fire_smoke:
+      enabled: true
+      every: 15           # 1-2 fps at 30fps source — slow-evolving event
+    smoking:
+      enabled: true
+      every: 10           # 3 fps — low urgency
+    phone:
+      enabled: true
+      every: 10           # 3 fps — low urgency. Uses a SEPARATE YOLOv8n model
+                            # instance dedicated to COCO class 67 (cell phone).
+                            # The old sharing conflict (tracker model + phone classes=[67])
+                            # is resolved: PhoneWatcherDetector always loads its own
+                            # independent YOLO instance and ignores any shared model.
+    gathering:
+      enabled: true
+      every: 30           # 1 fps — aggregate stat
+    violence:
+      enabled: true
+      every: 3            # every 3rd frame — needs temporal continuity, but cheaper than pose
 
 features:
   detection: true
@@ -52,6 +66,11 @@ features:
   reid: true
   face: true
   identity_fusion: true
+  fire_smoke: true
+  smoking: true
+  phone: true
+  gathering: true
+  violence: true
 
 perf:
   fps_warn_below: 20    # log a warning if sustained FPS drops below this

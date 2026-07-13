@@ -90,3 +90,61 @@ face:
   dim: 512                               # MobileFaceNet embedding dimension
   match_threshold: 0.4                   # cosine sim above this = same face
   index_path: models/face_index          # where to persist the enrolled-face FAISS index
+
+# --- Phase 4: Fire/Smoke Detection ---
+# PLACEHOLDER: Uses HSV color heuristic. Production should use a YOLOv8n
+# fine-tuned on a fire/smoke dataset (D-Fire, FireNet, etc.).
+# When fine-tuned weights are available, set `weights` to the .pt path and
+# the detector will switch to YOLO inference instead of color heuristic.
+fire_smoke:
+  weights: null                           # null = use HSV heuristic; set path for YOLO
+  fire_hsv_low: [0, 100, 150]            # HSV lower bound for fire (orange/red)
+  fire_hsv_high: [25, 255, 255]          # HSV upper bound for fire
+  fire_min_pixel_ratio: 0.01             # min fraction of frame matching fire to trigger
+  fire_min_duration: 2                   # consecutive fire detections required (reduces red-clothing FP)
+  # Smoke: tightened to near-white gray only — S<=30 excludes skin/warm tones,
+  # V 140-220 excludes very dark and overexposed white. Even after tightening
+  # this remains a COARSE PLACEHOLDER — real smoke needs a trained model.
+  smoke_hsv_low: [0, 0, 140]             # H: any hue, S: 0 (gray), V: 140 (not dark)
+  smoke_hsv_high: [180, 30, 220]         # H: any hue, S: 30 (low sat = gray only), V: 220
+  smoke_min_pixel_ratio: 0.60            # 60% of frame must be smoke-colored to trigger
+                                          # (was 0.01 — over-triggered on walls/skin/clothing
+                                          #  at 0.35-0.71 pixel_ratio in live testing)
+
+# --- Phase 4: Smoking Detection ---
+# PLACEHOLDER: Uses cigarette-glow heuristic near face/hand region.
+# Production should use a YOLO fine-tuned for cigarette detection.
+smoking:
+  weights: null                           # null = use glow heuristic; set path for YOLO
+  min_object_area: 20                    # min bright-pixel area to flag as cigarette glow
+  glow_hsv_low: [0, 100, 200]            # HSV for cigarette ember glow
+  glow_hsv_high: [20, 255, 255]
+
+# --- Phase 4: Phone-Watching Detection ---
+# Uses a separate YOLOv8n pass for COCO class 67 (cell phone) + head-pose
+# heuristic from Phase 2 pose keypoints (nose below shoulder line = looking down).
+phone:
+  weights: models/yolov8n.pt              # reuse the same YOLOv8n weights (COCO class 67)
+  imgsz: 320                              # small input — phone detection at low cadence
+  conf: 0.3
+
+# --- Phase 4: Personnel Gathering Detection ---
+# No model — clusters track centroids with fixed-radius grouping.
+gathering:
+  min_people: 3                           # minimum cluster size to trigger
+  radius_pixels: 150                      # max distance between people in a cluster
+  cooldown_s: 10.0                        # suppress re-trigger for the same cluster
+
+# --- Phase 4: Violence/Fighting Detection ---
+# PLACEHOLDER: Rule-based heuristic (bbox overlap + rapid relative motion).
+# Production should use MoViNet-A0 or a similar lightweight temporal model.
+violence:
+  # WEAK PLACEHOLDER — even after tightening, cannot distinguish fighting
+  # from handshakes/hugs/close conversation. VLM layer (Phase 6) must
+  # disambiguate. Real violence detection needs a temporal action model (MoViNet-A0).
+  # Thresholds raised based on live false-positive testing (ordinary proximity
+  # + talking between 2 people triggered 3 false positives at old values):
+  iou_threshold: 0.3                      # was 0.1 — raised to require real bbox overlap
+  motion_threshold: 40.0                 # was 15.0 — raised to require rapid movement
+  window_s: 1.5                           # was 1.0 — must sustain for 1.5s continuously
+  cooldown_s: 10.0                        # suppress re-trigger
