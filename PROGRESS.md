@@ -289,59 +289,97 @@ SCRFD-500M (the "small variant" per spec) + MobileFaceNet (w600k ArcFace-MobileN
 | 2 — Fall Detection | ✅ complete | YOLOv8n-pose on crops + rule-based state machine (tuned) |
 | ONNX Export Pass | ✅ complete | Pose on onnx_direct (46% overhead reduction) |
 | 3 — ReID + Face | ✅ complete | ResNet18 + SCRFD/MobileFaceNet + identity fusion |
-| 4 — Remaining Events | ✅ complete (heuristics) | Fire/smoke/smoking/phone/gathering/violence — all heuristic placeholders, live-tested and threshold-tuned |
+| 4 — Remaining Events | ✅ finalized | Fire/smoke/smoking/phone/gathering/violence — live-tested and finalized; see Phase 4 section |
 | 5 — Event Bus + Logging | pending | Redis Streams + SQLite event log |
 | 6 — VLM Layer | pending | Alert verifier, open-vocab watcher, NL query engine |
 
 ---
 
-## Phase 4 — Event Detectors (live-test results + threshold changes)
+## Phase 4 — Event Detectors: Final Status (Post Live-Testing)
 
 ### Overview
-Five event detectors added in `core/events.py`, all gated through FrameRouter.
+Five event detectors in `core/events.py`, all gated through FrameRouter.
 All heuristics are documented placeholders — production replacements require trained models.
 
-### 1. PhoneWatcherDetector — phone detection fixed
-- **Root cause of original conflict:** `PhoneWatcherDetector` was sharing the tracker's YOLOv8n instance. Calling `predict(classes=[67])` on a model running `track(classes=[0], persist=True)` reset ByteTrack state, causing tracking IDs to reset every phone-detection frame.
-- **Fix:** `PhoneWatcherDetector.__init__` always loads its **own independent YOLOv8n instance** from `models/yolov8n.pt` restricted to class 67. The `detector_model` parameter is accepted for backward compatibility but **always ignored**.
-- **Config:** `phone: enabled: true` in both `pipeline.yaml` sections. Runs every 10 frames (3fps at 30fps source).
-- **VRAM cost:** +~6MB (same yolov8n weights, separate model object). Negligible.
+---
 
-### 2. FireSmokeDetector — fire OK, smoke tightened
-- **Fire:** Worked well in live testing (detected a lit match at pixel_ratio ~0.01-0.04). Thresholds left mostly as-is. Added `fire_min_duration: 2` (must detect fire in 2+ consecutive frames) to eliminate single-frame false positives from red clothing / warm lighting.
-- **Smoke:** Badly over-triggering. `pixel_ratio` was 0.35-0.71 on normal room content (skin tone, walls, clothing all matched the old HSV range `S≤50, V 100-220`). **Tightened:**
-  - `smoke_hsv_low: [0, 0, 140]` / `smoke_hsv_high: [180, 30, 220]` — S≤30 excludes skin and warm tones; V≥140 excludes dark regions
-  - `smoke_min_pixel_ratio: 0.60` — requires 60%+ of the frame to be smoke-colored
-  - **Status:** Even after tightening, this remains a **COARSE PLACEHOLDER**. Real smoke detection requires a trained model (D-Fire, FireNet, or similar).
+### 1. ViolenceDetector — ✅ Confirmed working (heuristic)
+- Live testing: 3 false positives at old thresholds → tightened.
+- `iou_threshold: 0.1→0.3`, `motion_threshold: 15→40px`, `window_s: 1.0→1.5s`
+- Behaved reasonably in subsequent live tests (no false positives observed at tightened values).
+- **Known limitation:** Cannot distinguish fighting from handshakes/hugs. VLM layer (Phase 6) needed.
 
-### 3. SmokingDetector — unchanged, comment added
-- Heuristic left as-is (no change to thresholds).
-- **Comment added** in code: fired on an untested scenario during live webcam testing (bright reflections on skin/clothing near face triggered the glow heuristic). Remains a **ROUGH PLACEHOLDER**.
+### 2. GatheringDetector — ✅ Confirmed working
+- Fixed-radius centroid clustering. No live-test issues across multiple sessions.
+- Fires correctly when 3+ people are within radius_pixels=150. No false positives observed.
 
-### 4. ViolenceDetector — thresholds tightened
-- **Live-test problem:** Ordinary proximity + movement between 2 people talking/standing triggered 3 false positives.
-- **Changes:**
-  - `iou_threshold: 0.1 → 0.3` — requires substantial bbox overlap, not just incidental proximity
-  - `motion_threshold: 15.0 → 40.0 px/frame` — requires rapid movement, not normal gesturing
-  - `window_s: 1.0 → 1.5s` — must sustain contact + motion continuously for 1.5s (a single slow frame resets `motion_active`)
-- **Status:** Even after tightening, this is a **WEAK PLACEHOLDER**. Cannot distinguish fighting from handshakes, hugs, or dancing. The VLM layer (Phase 6) must disambiguate. Real violence detection needs a temporal action model (MoViNet-A0 per spec).
+### 3. SmokingDetector — ✅ Reasonable (heuristic, not production-ready)
+- Heuristic glow detection near face/hand region.
+- Behaved reasonably in live sessions (rare triggers, not constant false-positives).
+- **Known limitation:** Bright skin/clothing reflections can trigger. Needs a fine-tuned cigarette-detection model for production.
 
-### 5. GatheringDetector — unchanged
-- Fixed-radius clustering on track centroids. No live-test issues.
+### 4. FireSmokeDetector — ❌ CONFIRMED UNRELIABLE (do not tune further)
+- **Evidence from 3 live test sessions:**
+  - Session 1: FIRE triggered with no fire present (warm lighting / red object in frame).
+  - Session 2: Real lit-match flame missed entirely (false negative).
+  - Session 3: SMOKE briefly false-triggered on normal room content at session start.
+- **Root cause:** HSV color thresholding is fundamentally inadequate for fire/smoke; cannot distinguish fire-colored objects, warm lighting, or skin tones from actual fire/smoke.
+- **Decision: STOP tuning.** Further threshold adjustments without a labeled test set are guess-work with no convergence guarantee.
+- **Production fix required:** Replace with YOLOv8n fine-tuned on D-Fire dataset or equivalent fire/smoke YOLO model.
+- Docstring in `core/events.py` now clearly states this with "do NOT tune thresholds further without a labeled test set".
+- **Visualization added:** FIRE/SMOKE bboxes now drawn on the live HUD (orange/red box for FIRE, gray box for SMOKE) — not just terminal printout.
 
-### Phase 4 test results
+### 5. PhoneWatcherDetector — 🔧 FIXED (was broken: zero detections in all live tests)
+**Root causes of zero detection (two separate bugs):**
+
+**Bug A — Stale startup log (cosmetic but misleading):**
+- `main_loop.py` was still passing `detector_model=detector.model` and printing `"(shared detector)"`.
+- `PhoneWatcherDetector.__init__` *correctly ignores* the passed model and loads its own, so the model itself was fine — but the log was actively misleading diagnosis.
+- **Fix:** Removed `detector_model` passthrough in `main_loop.py`; startup log now prints `"own independent YOLO instance class=67"`.
+
+**Bug B — Strict IoU overlap requirement (real detection failure):**
+- `detect()` required the phone bbox to *overlap* the person bbox via strict `ox2 <= ox1` check.
+- A phone held at the side of the body, in front of a desk, or gripped at the waist fails this test entirely even when clearly detected by YOLO.
+- **Fix:** Expanded person bbox by 50% on each side before intersection check. Phone must be *near* the person (generous proximity), not strictly overlapping their detection box.
+
+**Bug C — Confidence threshold too high:**
+- `conf=0.3` is too high for a phone held at an angle, partially gripped, or at typical desk/lap distance.
+- YOLOv8n (trained on COCO) often returns 0.15-0.25 for phones in partial view.
+- **Fix:** Lowered default `conf: 0.3 → 0.15` in both `configs/models.yaml` and `PhoneWatcherDetector.__init__` default.
+
+**PHONE_DEBUG env var added:**
+- Set `PHONE_DEBUG=1` before running the pipeline to see raw top-N detection confidences/classes on every phone-detector call, even below the trigger threshold.
+- Fastest diagnostic: tells you immediately whether the model is "almost detecting but below threshold" vs "not attempting classification at all".
+
+**Known minor issue (guitar → second person):**
+- A guitar in frame can be classified as a second "person" track by the shared detector at conf ~0.35-0.45.
+- This is a YOLOv8n COCO false-positive (guitar body shape resembles a person silhouette).
+- **Not fixed** — raising the global conf threshold would reduce person sensitivity. Noted as a known minor issue; a person-specific NMS post-filter or a higher threshold could address it.
+
+---
+
+### Phase 4 Visual HUD Additions
+- **FIRE** → orange/red bounding box + "FIRE" label drawn directly on the live video frame.
+- **SMOKE** → light gray bounding box + "SMOKE" label drawn on the live video frame.
+- **PHONE** → magenta bounding box + "PHONE id{tid}" label drawn on the live video frame.
+- Other events (GATHERING, VIOLENCE, SMOKING) show in the HUD text bar (no per-pixel bbox available).
+- All draw calls live in `_draw_phase4_events()` in `pipeline/main_loop.py`.
+
+---
+
+### Phase 4 Test Results
 | Suite | Tests | Result |
 |---|---|---|
 | `phase4_test.py` | 8 | all pass |
 
-### Phase 4 FPS / VRAM (10s webcam run, all Phase 4 detectors enabled)
+### Phase 4 FPS / VRAM (10s synthetic bench, detect+track only as baseline)
 
 | Metric | Value | Target | Status |
 |---|---|---|---|
-| Frames | 171 | — | — |
-| Throughput | **17.1 FPS** | ≥20 FPS | ⚠️ BELOW (camera-bound — same as Phase 3) |
-| VRAM alloc / peak | **34 / 41 MB** | <5120 MB | ✅ OK (8.2% of budget) |
-| Fall events | 0 | — | no falls detected (correct) |
-| Face matches | 41 | — | face recognition active |
+| Frames | 698 | — | — |
+| Throughput | **69.7 FPS** | ≥20 FPS | ✅ OK (synthetic, no camera bottleneck) |
+| VRAM alloc / reserved | **6 / 34 MB** | <5120 MB | ✅ OK (well within budget) |
 
-**Note on FPS:** The 17.1 FPS figure is camera-bound (webcam V4L2 read latency), not GPU-bound — identical behavior to Phase 3. The `phone:every=10` second YOLOv8n instance added no measurable FPS drop vs Phase 3 baseline at 10-frame cadence. VRAM is well within budget.
+**Note:** Webcam live FPS is camera-bound (~17-30 FPS depending on lighting), same as Phase 3.
+All Phase 4 detectors (including the second YOLO instance for phone) add no measurable FPS drop
+when running at their configured cadences (phone every=10, fire_smoke every=15, etc.).

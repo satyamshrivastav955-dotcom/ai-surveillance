@@ -124,9 +124,10 @@ smoking:
 # Uses a separate YOLOv8n pass for COCO class 67 (cell phone) + head-pose
 # heuristic from Phase 2 pose keypoints (nose below shoulder line = looking down).
 phone:
-  weights: models/yolov8n.pt              # reuse the same YOLOv8n weights (COCO class 67)
+  weights: models/yolov8n.pt              # separate YOLOv8n instance, COCO class 67 only
   imgsz: 320                              # small input — phone detection at low cadence
-  conf: 0.3
+  conf: 0.15                              # lowered from 0.3 — phones at angle/distance rarely reach 0.3
+                                          # PHONE_DEBUG=1 env var shows raw confidences to diagnose misses
 
 # --- Phase 4: Personnel Gathering Detection ---
 # No model — clusters track centroids with fixed-radius grouping.

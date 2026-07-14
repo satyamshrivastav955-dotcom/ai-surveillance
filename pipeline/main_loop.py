@@ -95,6 +95,55 @@ def _draw_falls(frame: np.ndarray, fall_events) -> None:
                     (cx + 5, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
 
+# Phase 4 event bbox colors (BGR)
+_FIRE_COLOR  = (0, 80, 255)    # orange-red
+_SMOKE_COLOR = (200, 200, 200)  # light gray
+_PHONE_COLOR = (255, 0, 255)   # magenta
+
+
+def _draw_phase4_events(frame: np.ndarray, phase4_events: list) -> None:
+    """Draw bounding boxes + labels for FIRE, SMOKE, and PHONE events on the HUD.
+
+    FIRE  -> orange/red box with 'FIRE' label
+    SMOKE -> light gray box with 'SMOKE' label
+    PHONE -> magenta box with 'PHONE id{track_id}' label
+
+    Other event types (GATHERING, VIOLENCE, SMOKING) don't have per-pixel bboxes
+    so they are skipped here — their labels appear in the HUD text bar instead.
+    """
+    for ev in phase4_events:
+        et = ev.event_type
+        if et == "FIRE":
+            bbox = ev.details.get("bbox")
+            if bbox:
+                x1, y1, x2, y2 = bbox
+                cv2.rectangle(frame, (x1, y1), (x2, y2), _FIRE_COLOR, 3)
+                (tw, th), _ = cv2.getTextSize("FIRE", cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                cv2.rectangle(frame, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), _FIRE_COLOR, -1)
+                cv2.putText(frame, "FIRE", (x1 + 3, max(th, y1 - 3)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        elif et == "SMOKE":
+            bbox = ev.details.get("bbox")
+            if bbox:
+                x1, y1, x2, y2 = bbox
+                cv2.rectangle(frame, (x1, y1), (x2, y2), _SMOKE_COLOR, 2)
+                (tw, th), _ = cv2.getTextSize("SMOKE", cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(frame, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), _SMOKE_COLOR, -1)
+                cv2.putText(frame, "SMOKE", (x1 + 3, max(th, y1 - 3)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 30), 2)
+        elif et == "PHONE":
+            bbox = ev.details.get("phone_bbox")
+            tid  = ev.details.get("track_id", "?")
+            if bbox:
+                x1, y1, x2, y2 = bbox
+                label = f"PHONE id{tid}"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), _PHONE_COLOR, 2)
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                cv2.rectangle(frame, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), _PHONE_COLOR, -1)
+                cv2.putText(frame, label, (x1 + 3, max(th, y1 - 3)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+
 def _vram_mb() -> int:
     try:
         import torch
@@ -201,10 +250,11 @@ def run(config_path: str | None = None) -> None:
               f"method={'glow_heuristic' if models_cfg.get('smoking', {}).get('weights') is None else 'yolo'}")
     if features.get("phone") and router.is_enabled("phone"):
         from core.events import PhoneWatcherDetector
-        # reuse the shared detector model (avoid loading a 2nd YOLO)
-        phone_det = PhoneWatcherDetector(models_cfg.get("phone", {}),
-                                         detector_model=detector.model)
-        print(f"[phase4] phone enabled  every={router.every('phone')}  imgsz={phone_det.imgsz} (shared detector)")
+        # PhoneWatcherDetector always loads its own independent YOLOv8n instance
+        # (COCO class 67). detector_model kwarg is accepted but always ignored.
+        phone_det = PhoneWatcherDetector(models_cfg.get("phone", {}))
+        print(f"[phase4] phone enabled  every={router.every('phone')}  imgsz={phone_det.imgsz}  "
+              f"conf={phone_det.conf}  (independent YOLO instance, class=67)")
     if features.get("gathering") and router.is_enabled("gathering"):
         from core.events import GatheringDetector
         gathering_det = GatheringDetector(models_cfg.get("gathering", {}))
@@ -372,6 +422,8 @@ def run(config_path: str | None = None) -> None:
                     _draw_pose(vis, poses)
                 if fall_events:
                     _draw_falls(vis, fall_events)
+                if phase4_events:
+                    _draw_phase4_events(vis, phase4_events)
                 if resize_w and vis.shape[1] != resize_w:
                     scale = resize_w / vis.shape[1]
                     vis = cv2.resize(vis, (resize_w, int(vis.shape[0] * scale)))

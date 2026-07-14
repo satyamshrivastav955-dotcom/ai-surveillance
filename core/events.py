@@ -52,6 +52,14 @@ class Event:
 class FireSmokeDetector:
     """Detects fire and smoke using HSV color thresholding as a placeholder.
 
+    CONFIRMED UNRELIABLE via live testing (see PROGRESS.md) — false-positives
+    AND false-negatives both observed across 3 live test sessions:
+      - False-positive: fire triggered with no fire present (warm lighting / red objects).
+      - False-negative: a real lit-match flame was missed entirely in one session.
+      - Smoke false-triggered briefly on normal room content at session start.
+    Requires a trained YOLO model fine-tuned on a fire/smoke dataset (e.g., D-Fire)
+    for production use. Do NOT tune thresholds further without a labeled test set.
+
     PRODUCTION TODO: Replace with a YOLOv8n fine-tuned on a fire/smoke dataset
     (e.g., D-Fire, FireNet, or a custom Roboflow dataset). The config entry
     `fire_smoke.weights` points to where the fine-tuned .pt will live. For now
@@ -208,11 +216,14 @@ class SmokingDetector:
 class PhoneWatcherDetector:
     """Detects phone-watching behavior.
 
-    Two signals (both must be true):
-      (a) A cell phone (COCO class 67) is detected near the person's hand region
+    Detection logic:
+      (a) A cell phone (COCO class 67) is detected anywhere in frame OR near
+          a tracked person's extended bounding box (generous proximity check,
+          not strict overlap — phone may be held at side or partially off-body).
       (b) The person's head is tilted down — inferred from pose keypoints:
           nose y > shoulder midpoint y means the head is below the shoulder
-          line, suggesting looking down at a phone
+          line, suggesting looking down at a phone. Defaults to True (fires
+          anyway) when pose keypoints are unavailable or low-confidence.
 
     Uses a SEPARATE, independent YOLOv8n instance dedicated to phone detection
     (COCO class 67). This is intentionally NOT shared with the tracker's
@@ -221,16 +232,27 @@ class PhoneWatcherDetector:
     same model corrupted the tracker state. The second YOLO adds ~6MB VRAM
     (same yolov8n weights, separate model instance) and runs at low cadence
     (every 10 frames) so the compute cost is minimal.
+
+    Debug: set env PHONE_DEBUG=1 to print raw top-N detection confidences/classes
+    seen on every call, even below the trigger threshold. Fastest way to tell if
+    the model is "almost detecting but below threshold" vs "not classifying at all".
     """
 
     def __init__(self, cfg: dict[str, Any] | None = None,
                  detector_model=None):
-        # detector_model param is accepted for backward compat but IGNORED —
-        # we always load our own independent model to avoid the sharing conflict.
+        # detector_model param is accepted for backward compat but ALWAYS IGNORED.
+        # PhoneWatcherDetector loads its own independent YOLO to avoid the sharing
+        # conflict where predict(classes=[67]) on the tracker model corrupts
+        # ByteTrack state (tracker uses persist=True with classes=[0]).
         self.cfg = cfg if cfg is not None else _load_cfg("phone")
         self.imgsz = int(self.cfg.get("imgsz", 320))
-        self.conf = float(self.cfg.get("conf", 0.3))
+        # Lower default conf to 0.15 — a phone held at an angle, partially
+        # gripped, or at typical desk distance may not reach 0.3+. The shared
+        # detector uses 0.35 for persons (strong signal); phones are harder.
+        self.conf = float(self.cfg.get("conf", 0.15))
         self.device = 0
+        import os
+        self._debug = os.environ.get("PHONE_DEBUG", "0") == "1"
         from ultralytics import YOLO
         weights = self.cfg.get("weights", "models/yolov8n.pt")
         self.model = YOLO(weights)
@@ -239,23 +261,46 @@ class PhoneWatcherDetector:
         # warmup with a phone-class-only detection
         dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
         self.model.predict(dummy, imgsz=self.imgsz, device=0, half=True,
-                           conf=self.conf, classes=[67], verbose=False)
+                           conf=0.01, classes=[67], verbose=False)
         self._nose_idx = 0    # COCO-pose keypoint index for nose
         self._l_shoulder_idx = 5
         self._r_shoulder_idx = 6
+        print(f"[phase4] phone detector: own independent YOLO instance  "
+              f"weights={weights}  imgsz={self.imgsz}  conf={self.conf}  "
+              f"class=67(cell_phone)  PHONE_DEBUG={self._debug}")
 
     def detect(self, frame: np.ndarray, tracks: list, poses: list,
                frame_idx: int) -> list[Event]:
+        import os
         events: list[Event] = []
-        # run phone detection on the full frame at low res
+        # Run phone detection on the full frame at low res.
+        # Use a very low raw conf for the raw YOLO call so we can see all
+        # candidates in debug mode; apply self.conf filter ourselves.
+        raw_conf_floor = 0.01 if self._debug else self.conf
         res = self.model.predict(frame, imgsz=self.imgsz, device=0, half=True,
-                                 conf=self.conf, classes=[67], verbose=False)[0]
+                                 conf=raw_conf_floor, classes=[67], verbose=False)[0]
+
+        # --- PHONE_DEBUG: dump all raw candidates regardless of threshold ---
+        if self._debug and res.boxes is not None and len(res.boxes) > 0:
+            raw_confs = res.boxes.conf.cpu().numpy()
+            raw_cls = res.boxes.cls.cpu().numpy().astype(int)
+            raw_xyxy = res.boxes.xyxy.cpu().numpy().astype(int)
+            print(f"[PHONE_DEBUG] frame={frame_idx}  raw_detections={len(raw_confs)}")
+            for i, (rc, rcl, rbbox) in enumerate(zip(raw_confs, raw_cls, raw_xyxy)):
+                above = "ABOVE" if rc >= self.conf else "below"
+                print(f"  [{i}] cls={rcl}(cell_phone)  conf={rc:.3f}  "
+                      f"{above}_threshold({self.conf})  bbox={tuple(rbbox)}")
+        elif self._debug:
+            print(f"[PHONE_DEBUG] frame={frame_idx}  no detections at all (conf_floor=0.01, class=67)")
+
+        # Apply self.conf threshold to build the final phone_boxes list
         phone_boxes = []
         if res.boxes is not None and len(res.boxes) > 0:
             xyxy = res.boxes.xyxy.cpu().numpy().astype(int)
             confs = res.boxes.conf.cpu().numpy()
             for (bx1, by1, bx2, by2), c in zip(xyxy, confs):
-                phone_boxes.append(((int(bx1), int(by1), int(bx2), int(by2)), float(c)))
+                if c >= self.conf:
+                    phone_boxes.append(((int(bx1), int(by1), int(bx2), int(by2)), float(c)))
 
         if not phone_boxes:
             return events
@@ -266,6 +311,7 @@ class PhoneWatcherDetector:
             if p.track_id >= 0:
                 pose_map[p.track_id] = p.keypoints
 
+        fh, fw = frame.shape[:2]
         for tr in tracks:
             if getattr(tr, "cls", -1) != 0:
                 continue
@@ -273,22 +319,33 @@ class PhoneWatcherDetector:
             if tid < 0:
                 continue
             tx1, ty1, tx2, ty2 = tr.xyxy
-            # check if any phone box overlaps with this person's bbox
+            # Proximity check: expand the person bbox by 50% on each side to
+            # catch phones held at the side, in front of body, or partially
+            # outside the person detection box. Strict IoU overlap was the
+            # original bug — phone may not overlap the person bbox at all.
+            pad_x = int((tx2 - tx1) * 0.5)
+            pad_y = int((ty2 - ty1) * 0.5)
+            ex1 = max(0, tx1 - pad_x)
+            ey1 = max(0, ty1 - pad_y)
+            ex2 = min(fw, tx2 + pad_x)
+            ey2 = min(fh, ty2 + pad_y)
+
             for (pb, pc) in phone_boxes:
                 px1, py1, px2, py2 = pb
-                # IoU or overlap check
-                ox1 = max(tx1, px1); oy1 = max(ty1, py1)
-                ox2 = min(tx2, px2); oy2 = min(ty2, py2)
+                # Check if phone bbox intersects expanded person bbox
+                ox1 = max(ex1, px1); oy1 = max(ey1, py1)
+                ox2 = min(ex2, px2); oy2 = min(ey2, py2)
                 if ox2 <= ox1 or oy2 <= oy1:
-                    continue   # no overlap
+                    continue   # phone not near this person
                 # head-pose check: is the person looking down?
-                looking_down = True   # default if no pose available
+                # Default True (fire anyway) when pose data is unavailable —
+                # the phone detection itself is already strong evidence.
+                looking_down = True
                 kpts = pose_map.get(tid)
                 if kpts is not None:
                     nose = kpts[self._nose_idx]       # (x, y, conf)
                     l_sh = kpts[self._l_shoulder_idx]
                     r_sh = kpts[self._r_shoulder_idx]
-                    # use shoulders with sufficient confidence
                     sh_ys = []
                     if l_sh[2] > 0.3:
                         sh_ys.append(l_sh[1])
@@ -296,7 +353,6 @@ class PhoneWatcherDetector:
                         sh_ys.append(r_sh[1])
                     if nose[2] > 0.3 and len(sh_ys) >= 1:
                         shoulder_mid_y = sum(sh_ys) / len(sh_ys)
-                        # nose below shoulder line = looking down
                         looking_down = nose[1] > shoulder_mid_y
                 if looking_down:
                     events.append(Event(
