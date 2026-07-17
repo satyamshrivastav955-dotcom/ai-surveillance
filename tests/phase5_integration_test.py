@@ -408,6 +408,36 @@ def test_full_pipeline_constructs():
     print(f"        router stages active: {router.active_stages()}")
 
 
+def test_event_logger_log_fall_event():
+    """Verify that EventLogger can log and query a FallEvent object successfully."""
+    from core.state_machine import FallEvent
+    from core.event_logger import EventLogger
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = EventLogger(
+            db_path=str(Path(tmpdir) / "test.db"),
+            keyframes_dir=str(Path(tmpdir) / "kf"),
+        )
+        ev = FallEvent(
+            track_id=1,
+            t_iso="2024-01-01T12:00:00",
+            frame_idx=681,
+            aspect_now=1.51,
+            keypoints_low=True,
+            kp_height_frac=0.45,
+            upright_duration_s=5.0,
+            transition_delta_s=1.2,
+        )
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        logger.log_event(ev, frame=frame, frame_idx=681)
+        rows = logger.query_events(event_type="FALL")
+        assert len(rows) == 1, f"Expected 1 FALL event, got {len(rows)}"
+        assert rows[0]["event_type"] == "FALL"
+        assert rows[0]["frame_idx"] == 681
+        assert rows[0]["track_id"] == 1
+        logger.close()
+    print(f"  [ok] event_logger: FallEvent logged and queried correctly")
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -423,6 +453,7 @@ def main():
     test_event_logger_log_and_query()
     test_event_logger_saves_keyframe()
     test_event_logger_multi_type_query()
+    test_event_logger_log_fall_event()
     test_fire_smoke_multiframe_confirmation_blocks_single_frame()
     test_fire_smoke_hsv_fallback_resets_on_miss()
     test_phone_hysteresis_confirm_frames()

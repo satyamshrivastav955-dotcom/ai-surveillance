@@ -73,6 +73,22 @@ class FallEvent:
             "transition_delta_s": round(self.transition_delta_s, 3),
         }
 
+    @property
+    def event_type(self) -> str:
+        return "FALL"
+
+    @property
+    def details(self) -> dict[str, Any]:
+        return {
+            "track_id": self.track_id,
+            "aspect_now": round(self.aspect_now, 3),
+            "keypoints_low": bool(self.keypoints_low),
+            "kp_height_frac": round(self.kp_height_frac, 3),
+            "upright_duration_s": round(self.upright_duration_s, 3),
+            "transition_delta_s": round(self.transition_delta_s, 3),
+        }
+
+
 
 @dataclass
 class _TrackState:
