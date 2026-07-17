@@ -21,12 +21,15 @@ from core.reid import ReIDMatch
 @dataclass
 class IdentityEvent:
     """Emitted when a track's identity changes (face match, re-link, or loss)."""
-    track_id: int
-    label: str | None          # new label, or None if identity cleared
-    source: str                # "face" | "reid" | "lost"
+    event_type: str = "IDENTITY"  # for compatibility with EventLogger
+    track_id: int = 0
+    label: str | None = None          # new label, or None if identity cleared
+    source: str = ""                # "face" | "reid" | "lost"
     similarity: float = 0.0
     matched_track_id: int | None = None   # for reid: the old track we matched
     t_iso: str = ""
+    frame_idx: int = 0         # frame index for event logging
+    details: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -37,6 +40,7 @@ class IdentityEvent:
             "similarity": round(self.similarity, 3),
             "matched_track_id": self.matched_track_id,
             "t_iso": self.t_iso,
+            "frame_idx": self.frame_idx,
         }
 
 
@@ -53,7 +57,8 @@ class IdentityManager:
         # track_id -> {label, source, confirmed_at}
         self._identities: dict[int, dict] = {}
 
-    def on_face_match(self, match: FaceMatch, t: float | None = None) -> IdentityEvent | None:
+    def on_face_match(self, match: FaceMatch, t: float | None = None,
+                      frame_idx: int = 0) -> IdentityEvent | None:
         """Called when a face recognition match is found for a track.
 
         Returns an IdentityEvent if the track's identity changed, else None.
@@ -61,14 +66,12 @@ class IdentityManager:
         if t is None:
             t = time.perf_counter()
         if match.name is None:
-            return None   # no face match — no identity change
+            return None
         tid = match.track_id
         existing = self._identities.get(tid)
-        # if the track already has a face-confirmed identity that matches, no change
         if existing and existing["source"] == "face" and existing["label"] == match.name:
-            existing["confirmed_at"] = t   # refresh confirmation time
+            existing["confirmed_at"] = t
             return None
-        # face is the strongest signal — always override
         self._identities[tid] = {
             "label": match.name,
             "source": "face",
@@ -77,14 +80,18 @@ class IdentityManager:
         }
         import time as _t
         return IdentityEvent(
+            event_type="IDENTITY",
             track_id=tid,
             label=match.name,
             source="face",
             similarity=match.similarity,
             t_iso=_t.strftime("%Y-%m-%dT%H:%M:%S"),
+            frame_idx=frame_idx,
+            details={"track_id": tid, "label": match.name, "source": "face"},
         )
 
-    def on_reid_relink(self, match: ReIDMatch, t: float | None = None) -> IdentityEvent | None:
+    def on_reid_relink(self, match: ReIDMatch, t: float | None = None,
+                       frame_idx: int = 0) -> IdentityEvent | None:
         """Called when ReID re-links a new track to a lost track.
 
         Propagates the lost track's identity to the new track, but only if
@@ -99,10 +106,9 @@ class IdentityManager:
         new_id = match.new_track_id
         old = self._identities.get(old_id)
         if old is None or old["label"] is None:
-            return None   # old track had no identity to propagate
+            return None
         existing = self._identities.get(new_id)
         if existing and existing["source"] == "face":
-            # new track already has a face identity — don't override with ReID
             return None
         self._identities[new_id] = {
             "label": old["label"],
@@ -112,12 +118,15 @@ class IdentityManager:
         }
         import time as _t
         return IdentityEvent(
+            event_type="IDENTITY",
             track_id=new_id,
             label=old["label"],
             source="reid",
             similarity=match.similarity,
             matched_track_id=old_id,
             t_iso=_t.strftime("%Y-%m-%dT%H:%M:%S"),
+            frame_idx=frame_idx,
+            details={"track_id": new_id, "label": old["label"], "source": "reid"},
         )
 
     def on_track_lost(self, track_id: int) -> IdentityEvent | None:

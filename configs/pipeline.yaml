@@ -15,7 +15,13 @@ display:
   resize_w: 960         # display-only upscale; inference stays at detector.imgsz
   show_fps: true
   show_vram: true
-  window: "ai-surveillance (Phase 4)"
+  window: "ai-surveillance (Phase 4+)"
+
+# Motion prefilter — skip heavy stages on static frames
+motion_filter:
+  enabled: true
+  threshold: 0.01          # fraction of frame that must change to count as motion
+  min_changed_pixels: 1000 # minimum changed pixels to count as motion
 
 # ---- FrameRouter: every stage runs through this scheduler (constraint #4) ----
 # frequency is expressed as `every: N` meaning run once every N frames.
@@ -31,13 +37,13 @@ router:
       every: 1            # ByteTrack is CPU-cheap
     pose:
       enabled: true
-      every: 2            # every other frame — halves pose overhead
+      every: 3            # every 3rd frame — was 2; saves ~17% pose overhead, still smooth
     reid:
       enabled: true
-      every: 10           # only on new/re-appearing tracks (Section 4) — not every frame
+      every: 15           # raised from 10 — ReID only needed on new/re-appearing tracks
     face:
       enabled: true
-      every: 4            # every 3rd-5th frame on person crops (Section 4)
+      every: 8            # raised from 4 — buffalo_s is 5 ONNX models; biggest single FPS driver
     fire_smoke:
       enabled: true
       every: 15           # 1-2 fps at 30fps source — slow-evolving event
@@ -47,16 +53,19 @@ router:
     phone:
       enabled: true
       every: 10           # 3 fps — low urgency. Uses a SEPARATE YOLOv8n model
-                            # instance dedicated to COCO class 67 (cell phone).
-                            # The old sharing conflict (tracker model + phone classes=[67])
-                            # is resolved: PhoneWatcherDetector always loads its own
-                            # independent YOLO instance and ignores any shared model.
+                             # instance dedicated to COCO class 67 (cell phone).
+                             # The old sharing conflict (tracker model + phone classes=[67])
+                             # is resolved: PhoneWatcherDetector always loads its own
+                             # independent YOLO instance and ignores any shared model.
     gathering:
       enabled: true
       every: 30           # 1 fps — aggregate stat
     violence:
       enabled: true
       every: 3            # every 3rd frame — needs temporal continuity, but cheaper than pose
+    object_left:
+      enabled: true
+      every: 30           # 1 fps — track stationary objects
 
 features:
   detection: true
@@ -71,9 +80,13 @@ features:
   phone: true
   gathering: true
   violence: true
+  object_left: true
+  event_logging: true
 
 perf:
   fps_warn_below: 20    # log a warning if sustained FPS drops below this
   vram_log_path: benchmarks/vram_log.csv
   vram_warn_above_gb: 5 # constraint #2 — flag if exceeded
   vram_log_every_s: 5   # how often to append a VRAM sample
+  event_db_path: data/events.db
+  keyframes_dir: data/keyframes

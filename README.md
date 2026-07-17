@@ -5,11 +5,11 @@ core, with a **VLM layer** planned for Phase 6 (alert verification, open-vocabul
 descriptions, natural-language querying).
 
 **Target hardware:** RTX 4050 Laptop GPU, 6 GB VRAM. Every model choice and config
-value is constrained by this budget — 43 MB VRAM used across all active models (0.86% of budget).
+value is constrained by this budget — ~70–100 MB VRAM used across all active models (<2% of budget).
 
 ---
 
-## Status: Phase 4 complete
+## Status: Phase 4 Complete — Pre-VLM Baseline
 
 | Phase | What | Status |
 |---|---|---|
@@ -17,20 +17,21 @@ value is constrained by this budget — 43 MB VRAM used across all active models
 | 2 | YOLOv8n-pose on crops + rule-based fall detector | ✅ complete |
 | ONNX pass | onnx_direct for pose — 46% overhead reduction | ✅ complete |
 | 3 | ReID (ResNet18) + face recognition (SCRFD/MobileFaceNet) + identity fusion | ✅ complete |
-| 4 | Fire/smoke · smoking · phone-watching · gathering · violence detection | ✅ finalized |
-| 5 | Event bus + structured logging (Redis Streams + SQLite) | pending |
-| 6 | VLM layer — alert verifier, open-vocab watcher, NL query engine | pending |
+| 4 | Fire/smoke · smoking · phone · gathering · violence · object-left detection | ✅ complete |
+| — | Motion prefilter (frame differencing gates heavy stages) | ✅ complete |
+| — | Structured event logging (SQLite + keyframes) | ✅ complete |
+| 5 | VLM layer — alert verifier, open-vocab watcher, NL query engine | pending |
 
 ---
 
 ## Quick start
 
 ```bash
-# run the full live pipeline (all Phase 1-4 features enabled)
-python pipeline/main_loop.py
+# run the full live pipeline (all features enabled)
+python -m pipeline.main_loop
 
-# with explicit config
-python pipeline/main_loop.py --config configs/pipeline.yaml
+# run all tests (42 tests across 7 suites)
+python -m pytest tests/ -v
 ```
 
 Press **q** or **ESC** to quit.
@@ -55,9 +56,11 @@ features:
   reid: true
   face: true
   fire_smoke: true
+  smoking: true
   phone: true
   gathering: true
   violence: true
+  object_left: true
 ```
 
 ---
@@ -67,20 +70,49 @@ features:
 | Detector | Signal | Status |
 |---|---|---|
 | **Fall** | YOLOv8n-pose keypoints + bbox aspect ratio, rule-based state machine | ✅ tuned, live-tested |
-| **Violence** | Bbox overlap (IoU ≥ 0.3) + rapid relative motion (≥ 40 px/frame) sustained 1.5 s | ✅ heuristic, false-positives tightened |
+| **Fire/Smoke** | YOLOv8n fine-tuned on D-Fire (conf=0.45, multi-frame confirmation ≥2/5 frames) | ✅ real model, HSV fallback |
+| **Smoking** | YOLOv8n fine-tuned for cigarette/vape detection near tracked person | ✅ real model, HSV fallback |
+| **Phone** | Dedicated YOLOv8n (COCO cls 67), imgsz=480, confirm+hold hysteresis (3/15) | ✅ stable with hysteresis |
 | **Gathering** | Fixed-radius centroid clustering, fires on 3+ people within 150 px | ✅ works reliably |
-| **Smoking** | Cigarette-glow HSV heuristic near face/hand crop | ⚠️ rough placeholder — bright reflections can trigger |
-| **Phone** | Separate YOLOv8n instance, COCO class 67, proximity to tracked person + head-tilt pose heuristic | ✅ fixed (3 bugs patched in Phase 4 finalization) |
-| **Fire/Smoke** | HSV color thresholding | ❌ confirmed unreliable — FP and FN both observed in live testing. Needs D-Fire fine-tuned model for production |
+| **Violence** | Bbox overlap (IoU ≥ 0.3) + rapid motion (≥ 40 px/frame) sustained 1.5 s | ⚠️ heuristic placeholder — VLM will disambiguate |
+| **Object-Left** | Tracks stationary non-person objects (bags, suitcases) for >30s | ✅ complete |
 
-### Phase 4 HUD visualization
+### Models downloaded (free, open-source)
+
+| Model | Source | License |
+|---|---|---|
+| `fire_smoke_yolov8n.pt` | [rabahdev/fire-smoke-yolov8n](https://huggingface.co/rabahdev/fire-smoke-yolov8n) (HuggingFace) | AGPL-3.0 |
+| `smoking_yolov8n.pt` | [cadilak/smoking-detection-yolov8](https://huggingface.co/cadilak/smoking-detection-yolov8) (HuggingFace) | AGPL-3.0 |
+
+### HUD visualization
 
 Events are drawn on the live video window (not just logged to terminal):
 
 - 🟠 **FIRE** — orange/red bounding box + label
 - ⬜ **SMOKE** — light gray bounding box + label
 - 🟣 **PHONE** — magenta bounding box + `PHONE id{N}` label
+- 📦 **OBJECT_LEFT** — cyan bounding box + label + duration
 - **FALL / GATHERING / VIOLENCE / SMOKING** — appear in the HUD text bar
+
+---
+
+## Motion prefilter
+
+Cheap frame-differencing runs every frame and skips heavy stages (pose, reid, face,
+smoking, phone, gathering, violence, object_left) when the scene is completely static.
+Fire/smoke detection is NOT gated — fire can happen in a static monitoring scene.
+
+---
+
+## Event logging (Phase 5 foundation)
+
+All events are logged to SQLite at `data/events.db` with keyframe images saved to
+`data/keyframes/`. Schema: `id, t_iso, frame_idx, event_type, track_id, confidence,
+details_json, keyframe_path, created_at`. Indexed on `event_type`, `t_iso`, `track_id`.
+
+Query API: `event_logger.query_events(event_type=None, track_id=None, limit=100)`
+
+This is the foundation for the VLM layer's natural-language query engine.
 
 ---
 
@@ -88,30 +120,35 @@ Events are drawn on the live video window (not just logged to terminal):
 
 | Metric | Value |
 |---|---|
-| Webcam FPS (all features active) | ~17–30 FPS (camera-bound, not GPU-bound) |
-| Synthetic source ceiling | 109.6 FPS |
-| Combined VRAM (all models) | 43 MB alloc / ~51 MB peak |
-| Budget used | 0.86% of 5 GB |
+| Webcam FPS (all features active) | ~15–20 FPS (camera-bound) |
+| Peak FPS (synthetic source) | ~100+ FPS |
+| Total VRAM | ~70–100 MB alloc / ~94 MB reserved |
+| Budget used | <2% of 6 GB |
 
-> FPS varies with lighting — webcam auto-exposure sets the effective frame rate.
-> The pipeline is GPU-bound only above ~110 FPS (synthetic source).
+> FPS drops to ~15 when face recognition (buffalo_s, 5 ONNX models) runs; held to ≥20
+> at other frames. Cadence tuning (face/8, reid/15, pose/3) recovers throughput.
 
 ---
 
 ## Test suites
 
 ```bash
-python tests/smoke_test.py              # Phase 1: imports + one-frame inference
-python tests/phase2_smoke.py            # Phase 2: pose + fall detector construction
-python tests/phase3_smoke.py            # Phase 3: ReID + face + identity (isolated index)
-python tests/fall_detection_test.py     # 5 fall tests
-python tests/fall_cadence_test.py       # 3 fall tests at every=2 cadence
-python tests/fall_false_positive_test.py # 4 false-positive guard tests
-python tests/phase3_test.py             # 5 ReID + face recognition tests
-python tests/phase4_test.py             # 8 Phase 4 event detector tests
+python -m pytest tests/ -v                    # run all 42 tests
+python tests/smoke_test.py                    # Phase 1: imports + one-frame inference
+python tests/fall_detection_test.py           # 5 fall detector tests
+python tests/fall_cadence_test.py             # 3 fall tests at configured cadence
+python tests/fall_false_positive_test.py      # 4 false-positive guard tests
+python tests/phase3_test.py                   # 5 ReID + face recognition tests
+python tests/phase4_test.py                   # 8 Phase 4 event detector tests
+python tests/phase5_integration_test.py       # 14 integration tests (new features)
 ```
 
-**All 32 tests pass across 8 suites.**
+**42/42 tests pass across 7 suites.**
+
+Tests cover: ObjectLeftDetector (3), MotionPrefilter (3), EventLogger (3),
+fire/smoke multi-frame confirmation (2), phone hysteresis (2), full pipeline
+construction (1), fall detection + FP suppression (12), face/ReID (5),
+all Phase 4 detectors (8), core infrastructure (3).
 
 ---
 
@@ -119,12 +156,13 @@ python tests/phase4_test.py             # 8 Phase 4 event detector tests
 
 | Env var | Effect |
 |---|---|
-| `PHONE_DEBUG=1` | Print raw YOLO confidences/classes for every phone-detector call (even below threshold) — fastest way to diagnose missed detections |
-| `FALL_DEBUG=1` | Log next 10 fall trigger candidates with full signal breakdown (aspect, kp_frac, upright duration) |
+| `PHONE_DEBUG=1` | Print raw YOLO confidences/classes for every phone-detector call (even below threshold) |
+| `FALL_DEBUG=1` | Log next 10 fall trigger candidates with full signal breakdown |
+| `DEBUG_DEVICE=1` | Print model device before each inference call |
 
 Example:
 ```bash
-PHONE_DEBUG=1 python pipeline/main_loop.py
+PHONE_DEBUG=1 python -m pipeline.main_loop
 ```
 
 ---
@@ -133,7 +171,7 @@ PHONE_DEBUG=1 python pipeline/main_loop.py
 
 ```
 configs/
-  models.yaml        model registry: weights, thresholds, HSV params
+  models.yaml        model registry: weights, thresholds, hysteresis params
   pipeline.yaml      source, display, FrameRouter stages, feature toggles
 core/
   detector.py        YOLOv8n wrapper (pytorch/onnx/onnx_direct)
@@ -143,22 +181,24 @@ core/
   reid.py            ResNet18 + FAISS re-identification
   face.py            SCRFD + MobileFaceNet + FAISS face index
   identity.py        Identity fusion (face > ReID priority)
-  events.py          Phase 4: fire/smoke, smoking, phone, gathering, violence
+  events.py          Phase 4: fire/smoke, smoking, phone, gathering, violence, object-left
+  motion_filter.py   Frame differencing prefilter
+  event_logger.py    SQLite event logger + keyframe storage
   video_source.py    Webcam / file / RTSP / synthetic source abstraction
   config.py          YAML loaders + warning filters
 pipeline/
   frame_router.py    Config-driven stage scheduler (no scattered modulo checks)
-  main_loop.py       Full pipeline: capture→detect→track→pose→reid→face→events→display
+  main_loop.py       Full pipeline: capture→detect→track→pose→reid→face→events→log→display
 tools/
   export_onnx.py     Reproducible FP16 ONNX export for detector + pose
   enroll_face.py     Webcam face enrollment script
 benchmarks/
   vram_profile.py    Isolated VRAM profiler for all models
   fps_bench.py       Headless throughput benchmark
-tests/               Unit + integration test suites (see above)
+tests/               Unit + integration test suites (42 tests, 7 suites)
 models/              Weights directory (gitignored — see models/README.md for download links)
+data/                Event log database + keyframe images (runtime-generated)
 vlm/                 Phase 6 stub
-storage/             Phase 5 stub
 ```
 
 ---
@@ -168,5 +208,16 @@ storage/             Phase 5 stub
 - **One shared YOLO instance** for all person detection + tracking. Exception: `PhoneWatcherDetector` loads its own independent YOLOv8n (COCO class 67 only) — sharing caused tracker state corruption.
 - **FP16 on CUDA** everywhere (`half: true` in `models.yaml`).
 - **FrameRouter** gates every stage — no scattered `frame_count % N` checks. Cadence changes are config edits.
+- **Motion prefilter** skips heavy stages on static frames (pose, reid, face, phone, smoking, gathering, violence, object_left).
 - **Every feature is toggleable** in `configs/pipeline.yaml` — no code changes to disable a phase.
 - **VRAM logged** every 5 s to `benchmarks/vram_log.csv`; warning printed above 5 GB.
+
+---
+
+## License
+
+- Code: MIT
+- YOLO models: AGPL-3.0 (Ultralytics)
+- D-Fire model: AGPL-3.0 (rabahdev/fire-smoke-yolov8n)
+- Smoking model: AGPL-3.0 (cadilak/smoking-detection-yolov8)
+- InsightFace: MIT

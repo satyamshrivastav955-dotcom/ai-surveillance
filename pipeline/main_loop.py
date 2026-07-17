@@ -178,6 +178,17 @@ def run(config_path: str | None = None) -> None:
 
     router = FrameRouter(cfg.get("router", {}))
 
+    # Motion prefilter — skip heavy stages on static frames
+    motion_cfg = cfg.get("motion_filter", {})
+    motion_filter = None
+    if motion_cfg.get("enabled", True):
+        from core.motion_filter import MotionPrefilter
+        motion_filter = MotionPrefilter(
+            threshold=motion_cfg.get("threshold", 0.01),
+            min_changed_pixels=motion_cfg.get("min_changed_pixels", 1000)
+        )
+        print("[motion] prefilter enabled")
+
     # --- models -----------------------------------------------------------
     detector = Detector()
     tracker = Tracker(detector)
@@ -231,13 +242,14 @@ def run(config_path: str | None = None) -> None:
         identity_mgr = IdentityManager()
         print("[phase3] identity fusion enabled")
 
-    # Phase 4: fire/smoke, smoking, phone, gathering, violence.
+    # Phase 4: fire/smoke, smoking, phone, gathering, violence, object_left.
     # All gated by FrameRouter + features config (constraint #6).
     fire_smoke_det = None
     smoking_det = None
     phone_det = None
     gathering_det = None
     violence_det = None
+    object_left_det = None
     if features.get("fire_smoke") and router.is_enabled("fire_smoke"):
         from core.events import FireSmokeDetector
         fire_smoke_det = FireSmokeDetector(models_cfg.get("fire_smoke", {}))
@@ -265,12 +277,27 @@ def run(config_path: str | None = None) -> None:
         violence_det = ViolenceDetector(models_cfg.get("violence", {}))
         print(f"[phase4] violence enabled  every={router.every('violence')}  "
               f"method=heuristic_placeholder")
+    if features.get("object_left") and router.is_enabled("object_left"):
+        from core.events import ObjectLeftDetector
+        object_left_det = ObjectLeftDetector(models_cfg.get("object_left", {}))
+        print(f"[phase4] object_left enabled  every={router.every('object_left')}  "
+              f"min_stationary={object_left_det.min_stationary_s}s")
 
     # --- source -----------------------------------------------------------
     source: VideoSource = build_source(src_cfg)
     source.open()
     if not source.isOpened():
         raise RuntimeError("Video source failed to open")
+
+    # --- event logging (Phase 5 foundation) ---
+    event_logger = None
+    if features.get("event_logging", True):
+        from core.event_logger import EventLogger
+        event_logger = EventLogger(
+            db_path=perf.get("event_db_path", "data/events.db"),
+            keyframes_dir=perf.get("keyframes_dir", "data/keyframes")
+        )
+        print("[phase5] event logging enabled")
 
     # --- logging ----------------------------------------------------------
     vram_writer = None
@@ -320,10 +347,15 @@ def run(config_path: str | None = None) -> None:
                     for d in detector.detect(frame)
                 ]
 
+            # --- Motion prefilter: skip heavy stages on static frames ---
+            has_motion = True  # Default to True (process everything)
+            if motion_filter is not None:
+                has_motion = motion_filter.has_motion(frame)
+
             # --- Phase 2: pose on person crops, then fall state machine ---
             poses = []
             fall_events = []
-            if pose_est is not None and router.should_run("pose", frame_idx):
+            if has_motion and pose_est is not None and router.should_run("pose", frame_idx):
                 # Run pose only on person-class tracks (COCO cls == 0). If the
                 # detector was configured with classes=null and the scene has
                 # /no/ persons, this is empty — pose simply doesn't fire that
@@ -339,7 +371,7 @@ def run(config_path: str | None = None) -> None:
 
             # --- Phase 3: ReID + face recognition + identity fusion ---
             identity_events = []
-            if reid_mgr is not None and router.should_run("reid", frame_idx):
+            if has_motion and reid_mgr is not None and router.should_run("reid", frame_idx):
                 relinks = reid_mgr.on_tracks_updated(frame, tracks)
                 for m in relinks:
                     if m.matched_track_id is not None:
@@ -347,13 +379,13 @@ def run(config_path: str | None = None) -> None:
                               f"-> lost track {m.matched_track_id} "
                               f"(sim={m.similarity:.2f})")
                     if identity_mgr is not None:
-                        ev = identity_mgr.on_reid_relink(m)
+                        ev = identity_mgr.on_reid_relink(m, frame_idx=frame_idx)
                         if ev:
                             identity_events.append(ev)
                             print(f"[phase3] IDENTITY: track {ev.track_id} "
                                   f"= '{ev.label}' (via {ev.source})")
 
-            if face_rec is not None and router.should_run("face", frame_idx):
+            if has_motion and face_rec is not None and router.should_run("face", frame_idx):
                 for tr in tracks:
                     if getattr(tr, "cls", -1) != 0:
                         continue
@@ -372,7 +404,7 @@ def run(config_path: str | None = None) -> None:
                             print(f"[phase3] FACE: track {tid} = '{fm.name}' "
                                   f"(sim={fm.similarity:.2f})")
                         if identity_mgr is not None:
-                            ev = identity_mgr.on_face_match(fm)
+                            ev = identity_mgr.on_face_match(fm, frame_idx=frame_idx)
                             if ev:
                                 identity_events.append(ev)
                                 # propagate the face-confirmed identity to the ReID index
@@ -381,20 +413,33 @@ def run(config_path: str | None = None) -> None:
                                 print(f"[phase3] IDENTITY: track {ev.track_id} "
                                       f"= '{ev.label}' (via {ev.source})")
 
-            # --- Phase 4: fire/smoke, smoking, phone, gathering, violence ---
+            # --- Phase 4: fire/smoke, smoking, phone, gathering, violence, object_left ---
             phase4_events: list = []
+            # Fire/smoke events can happen in static scenes (e.g., monitoring),
+            # so they're not gated by motion. Others are gated.
             if fire_smoke_det is not None and router.should_run("fire_smoke", frame_idx):
                 phase4_events.extend(fire_smoke_det.detect(frame, frame_idx))
-            if smoking_det is not None and router.should_run("smoking", frame_idx):
+            if has_motion and smoking_det is not None and router.should_run("smoking", frame_idx):
                 phase4_events.extend(smoking_det.detect(frame, tracks, frame_idx))
-            if phone_det is not None and router.should_run("phone", frame_idx):
+            if has_motion and phone_det is not None and router.should_run("phone", frame_idx):
                 phase4_events.extend(phone_det.detect(frame, tracks, poses, frame_idx))
-            if gathering_det is not None and router.should_run("gathering", frame_idx):
+            if has_motion and gathering_det is not None and router.should_run("gathering", frame_idx):
                 phase4_events.extend(gathering_det.detect(tracks, frame_idx, t=time.perf_counter()))
-            if violence_det is not None and router.should_run("violence", frame_idx):
+            if has_motion and violence_det is not None and router.should_run("violence", frame_idx):
                 phase4_events.extend(violence_det.detect(tracks, frame_idx, t=time.perf_counter()))
+            if has_motion and object_left_det is not None and router.should_run("object_left", frame_idx):
+                phase4_events.extend(object_left_det.detect(tracks, frame_idx, t=time.perf_counter()))
             for ev in phase4_events:
                 print(f"[phase4] {ev.event_type} frame={ev.frame_idx} {ev.details}")
+
+            # --- event logging (Phase 5 foundation) ---
+            if event_logger is not None:
+                for ev in phase4_events:
+                    event_logger.log_event(ev, frame, frame_idx)
+                for ev in fall_events:
+                    event_logger.log_event(ev, frame, frame_idx)
+                for ev in identity_events:
+                    event_logger.log_event(ev, frame, frame_idx)
 
             # --- display ----------------------------------------------------
             if disp.get("enabled", True):
