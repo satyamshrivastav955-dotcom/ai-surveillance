@@ -133,19 +133,19 @@ This is the foundation for the VLM layer's natural-language query engine.
 ## Test suites
 
 ```bash
-python -m pytest tests/ -v                    # run all 42 tests
+python -m pytest tests/ -v                    # run all 43 tests
 python tests/smoke_test.py                    # Phase 1: imports + one-frame inference
 python tests/fall_detection_test.py           # 5 fall detector tests
 python tests/fall_cadence_test.py             # 3 fall tests at configured cadence
 python tests/fall_false_positive_test.py      # 4 false-positive guard tests
 python tests/phase3_test.py                   # 5 ReID + face recognition tests
 python tests/phase4_test.py                   # 8 Phase 4 event detector tests
-python tests/phase5_integration_test.py       # 14 integration tests (new features)
+python tests/phase5_integration_test.py       # 15 integration tests (new features)
 ```
 
-**42/42 tests pass across 7 suites.**
+**43/43 tests pass across 7 suites.**
 
-Tests cover: ObjectLeftDetector (3), MotionPrefilter (3), EventLogger (3),
+Tests cover: ObjectLeftDetector (3), MotionPrefilter (3), EventLogger (4),
 fire/smoke multi-frame confirmation (2), phone hysteresis (2), full pipeline
 construction (1), fall detection + FP suppression (12), face/ReID (5),
 all Phase 4 detectors (8), core infrastructure (3).

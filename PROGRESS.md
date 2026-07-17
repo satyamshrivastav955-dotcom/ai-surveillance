@@ -127,10 +127,10 @@ A real-time AI security camera system built on a pure deep-learning pipeline (Ph
 | fall_false_positive_test.py | 4 | ✅ pass |
 | phase3_test.py | 5 | ✅ pass |
 | phase4_test.py | 8 | ✅ pass |
-| phase5_integration_test.py | 14 | ✅ pass |
-| **Total** | **42** | **42/42 pass** |
+| phase5_integration_test.py | 15 | ✅ pass |
+| **Total** | **43** | **43/43 pass** |
 
-Tests cover: ObjectLeftDetector, MotionPrefilter, EventLogger (log/query/keyframe),
+Tests cover: ObjectLeftDetector, MotionPrefilter, EventLogger (log/query/keyframe/fall),
 fire/smoke multi-frame confirmation, phone hysteresis (confirm + hold), full pipeline
 simultaneous construction, fall detection FP suppression, face enroll/recognize, ReID relink.
 
@@ -171,11 +171,12 @@ No cross-feature interference observed: phone detection does not break tracking 
 
 | File | Change |
 |---|---|
-| `README.md` | Full rewrite reflecting all Phase 4+ features, real models, 42 tests |
+| `README.md` | Full rewrite reflecting all Phase 4+ features, real models, 43 tests |
 | `configs/models.yaml` | detector.classes expanded; fire_smoke.conf=0.45; phone imgsz/confirm/hold |
 | `configs/pipeline.yaml` | pose/3, reid/15, face/8 (FPS tuning) |
 | `core/events.py` | FireSmokeDetector: multi-frame confirmation; PhoneWatcherDetector: confirm+hold hysteresis; ObjectLeftDetector: off-by-one window fix |
-| `tests/phase5_integration_test.py` | NEW: 14 integration tests covering all Phase 4+ features |
+| `core/state_machine.py` | FallEvent: added event_type and details properties for event logger support |
+| `tests/phase5_integration_test.py` | NEW: 15 integration tests covering all Phase 4+ features |
 
 ---
 
