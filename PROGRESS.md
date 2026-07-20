@@ -1,10 +1,10 @@
-# AI Surveillance System — Phase 4 Complete / Pre-VLM Baseline
+# AI Surveillance System — Phase 5 (Multi-Task Analytics) In Progress
 
 ## Project Overview
 
 A real-time AI security camera system built on a pure deep-learning pipeline (Phases 1-4+) with VLM layer planned for Phase 6. Target hardware: **RTX 4050 Laptop GPU, 6GB VRAM**.
 
-**Status: Phase 4 Complete — Pre-VLM Baseline Locked**
+**Status: Phase 5A/5D/5F Complete — Pose Smoothing, Fight Detection, Windowed JSON Emission**
 
 ---
 
@@ -20,8 +20,15 @@ A real-time AI security camera system built on a pure deep-learning pipeline (Ph
 | Motion Prefilter | ✅ complete | Frame differencing gates heavy stages on static scenes |
 | Object-Left-Behind | ✅ complete | Tracks stationary non-person objects for >30s |
 | Structured Event Log | ✅ complete | SQLite + keyframes (Phase 5 foundation) |
-| Pre-VLM Integration | ✅ complete | 42/42 tests pass, full pipeline confirmed |
-| 5 — VLM Layer | 🔜 pending | Alert verifier, open-vocab watcher, NL query engine |
+| Pre-VLM Integration | ✅ complete | 43/43 tests pass, full pipeline confirmed |
+| **5A — Pose Smoother** | ✅ **NEW** | One-Euro filter + EMA bbox + confidence gating per keypoint |
+| **5D — Fight Detector** | ✅ **NEW** | Skeleton velocity + proximity + oscillation signals |
+| **5D — Clip Writer** | ✅ **NEW** | 5s ring-buffer → mp4 clip on fight trigger |
+| **5F — Event Buffer** | ✅ **NEW** | Windowed JSON flush (10s interval, spec-compliant schema) |
+| 5B — PAR (attributes) | 🔜 pending | ResNet50 multi-label head (model download required) |
+| 5C — ROI Upgrade | 🔜 pending | Polygon-gated gathering detection |
+| 5E — Smoking upgrade | 🔜 pending | Pose-gesture primary + YOLO confirm |
+| 6 — VLM Layer | 🔜 pending | Alert verifier, open-vocab watcher, NL query engine |
 
 ---
 

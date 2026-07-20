@@ -1,0 +1,25 @@
+# ===== roi.yaml =====
+# Per-camera ROI polygon definitions for the GatheringDetector and
+# future zone-based analytics.
+#
+# Each entry defines one camera. The `rois` list contains one or more
+# named polygons. Each polygon is a list of [x, y] pixel coordinates.
+#
+# Special value:  null polygon = use entire frame (current default behaviour).
+#
+# Example: two ROIs for camera "cam_01":
+#   cameras:
+#     cam_01:
+#       rois:
+#         - id: main_floor
+#           polygon: [[0, 0], [1280, 0], [1280, 720], [0, 720]]
+#         - id: entrance
+#           polygon: [[800, 0], [1280, 0], [1280, 300], [800, 300]]
+
+cameras:
+  cam_01:
+    rois:
+      - id: default
+        polygon: null      # null = whole frame
+        # Uncomment and set pixel coords to restrict gathering detection to a zone:
+        # polygon: [[0, 0], [1280, 0], [1280, 720], [0, 720]]

@@ -18,6 +18,18 @@ detector:
   classes: [0, 24, 26, 28, 39]          # persons (0) + backpack (24) + handbag (26) + suitcase (28) + bottle (39)
                                         # ObjectLeftDetector requires non-person classes; cost is negligible (rare classes)
 
+# --- Phase 5A: Pose Smoother ---
+# One-Euro filter per keypoint + EMA bbox stabilisation + confidence gating.
+# Applied after raw pose estimation; output feeds fall detector, fight, smoking.
+pose_smoother:
+  min_cutoff: 1.0          # One-Euro min cutoff (Hz). Lower = smoother, more lag.
+  beta: 0.007              # One-Euro speed coeff. Higher = faster on fast motions.
+  gate_conf: 0.30          # Reject keypoints below this confidence; hold last good.
+  hold_frames: 6           # Hold last-good position for this many low-conf frames.
+  ema_alpha: 0.6           # EMA weight for bbox (1.0=no smoothing, 0.0=frozen).
+  teleport_px: 100.0       # Jump above this px triggers filter re-init (ID switch guard).
+  freq: 30.0               # Camera fps hint for One-Euro filter.
+
 # --- Phase 2: pose for fall detection ---
 # Runs only on person crops from the tracker's boxes, never full frame.
 # Same ultralytics family -> same optimizations, single warmup.
@@ -145,14 +157,25 @@ gathering:
   radius_pixels: 150                      # max distance between people in a cluster
   cooldown_s: 10.0                        # suppress re-trigger for the same cluster
 
-# --- Phase 4: Violence/Fighting Detection ---
-# PLACEHOLDER: Rule-based heuristic (bbox overlap + rapid relative motion).
-# Production should use MoViNet-A0 or a similar lightweight temporal model.
+# --- Phase 4: Violence/Fighting Detection (heuristic placeholder — kept for fallback) ---
+# Phase 5D adds FightDetector which uses skeleton velocity signals.
+# Both run simultaneously; FightDetector emits FIGHT, ViolenceDetector emits VIOLENCE.
 violence:
   iou_threshold: 0.3
   motion_threshold: 40.0
   window_s: 1.5
   cooldown_s: 10.0
+
+# --- Phase 5D: Skeleton-Based Fight Detection ---
+# Runs on smoothed poses from PoseSmoother (Phase 5A).
+# Emits FightEvent with clip_ref when kinematic fight signatures are sustained.
+fight:
+  proximity_px: 200.0        # max centroid distance to form a "pair of interest"
+  active_keypoints: [5,6,7,8,9,10,15,16]  # shoulder/elbow/wrist/ankle
+  velocity_threshold: 15.0   # mean px/frame above which motion is "high"
+  window_s: 1.5              # signals must sustain for this long
+  cooldown_s: 10.0           # suppress re-trigger for same pair
+  min_window_frames: 15      # minimum history frames before classifier runs
 
 # --- Phase 4: Object-Left-Behind Detection ---
 # Tracks non-person objects (bags, backpacks, suitcases) that remain stationary.

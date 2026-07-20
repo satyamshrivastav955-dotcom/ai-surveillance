@@ -199,15 +199,20 @@ def run(config_path: str | None = None) -> None:
     features = cfg.get("features", {})
     pose_est = None
     fall_det = None
+    pose_smoother = None
     if features.get("pose") and router.is_enabled("pose"):
         from core.pose import PoseEstimator
         from core.state_machine import FallDetector
+        from core.pose_smoother import PoseSmoother
         pose_est = PoseEstimator()
         fall_cfg = (load_pipeline_config() if config_path is None else _load_extra(config_path))
         # fall thresholds live in models.yaml, not pipeline.yaml
         from core.config import load_models_config
         fall_det = FallDetector(load_models_config().get("fall", {}))
+        pose_smoother = PoseSmoother(load_models_config().get("pose_smoother", {}))
         print(f"[phase2] pose enabled  imgsz={pose_est.imgsz} half={pose_est.half}")
+        print(f"[phase5a] pose_smoother enabled  min_cutoff={pose_smoother._min_cutoff}  "
+              f"beta={pose_smoother._beta}  gate_conf={pose_smoother._gate_conf}")
     if features.get("fall_detection") and fall_det is None:
         # fall_detection feature without pose is meaningless — warn loudly
         from core.state_machine import FallDetector
@@ -277,6 +282,22 @@ def run(config_path: str | None = None) -> None:
         violence_det = ViolenceDetector(models_cfg.get("violence", {}))
         print(f"[phase4] violence enabled  every={router.every('violence')}  "
               f"method=heuristic_placeholder")
+
+    # Phase 5D: skeleton-based fight detector
+    fight_det = None
+    clip_writer = None
+    if features.get("fight") and router.is_enabled("fight"):
+        from core.fight_detector import FightDetector
+        fight_det = FightDetector(models_cfg.get("fight", {}))
+        print(f"[phase5d] fight_detector enabled  every={router.every('fight')}  "
+              f"proximity_px={fight_det._proximity_px}")
+    clip_cfg = cfg.get("clip_writer", {})
+    if clip_cfg.get("enabled", True) and fight_det is not None:
+        from core.clip_writer import ClipWriter
+        clip_writer = ClipWriter(clip_cfg)
+        print(f"[phase5d] clip_writer enabled  buffer_s={clip_writer._buf_s}s  "
+              f"dir={clip_writer._clips_dir}")
+
     if features.get("object_left") and router.is_enabled("object_left"):
         from core.events import ObjectLeftDetector
         object_left_det = ObjectLeftDetector(models_cfg.get("object_left", {}))
@@ -289,7 +310,7 @@ def run(config_path: str | None = None) -> None:
     if not source.isOpened():
         raise RuntimeError("Video source failed to open")
 
-    # --- event logging (Phase 5 foundation) ---
+    # --- event logging (Phase 5 foundation — SQLite per-event) ---
     event_logger = None
     if features.get("event_logging", True):
         from core.event_logger import EventLogger
@@ -297,7 +318,16 @@ def run(config_path: str | None = None) -> None:
             db_path=perf.get("event_db_path", "data/events.db"),
             keyframes_dir=perf.get("keyframes_dir", "data/keyframes")
         )
-        print("[phase5] event logging enabled")
+        print("[phase5] event logging enabled (SQLite)")
+
+    # --- event buffer (Phase 5F — windowed JSON flush) ---
+    event_buffer = None
+    if features.get("event_buffer", True):
+        from core.event_buffer import EventBuffer
+        out_cfg = cfg.get("output", {})
+        event_buffer = EventBuffer(out_cfg)
+        print(f"[phase5f] event_buffer enabled  flush={event_buffer._flush_interval}s  "
+              f"dir={event_buffer._json_dir}")
 
     # --- logging ----------------------------------------------------------
     vram_writer = None
@@ -361,7 +391,12 @@ def run(config_path: str | None = None) -> None:
                 # /no/ persons, this is empty — pose simply doesn't fire that
                 # frame, which is the VRAM/compute win we want.
                 person_tracks = [t for t in tracks if getattr(t, "cls", -1) == 0]
-                poses = pose_est.estimate_crops(frame, person_tracks)
+                raw_poses = pose_est.estimate_crops(frame, person_tracks)
+                # Phase 5A: smooth keypoints before feeding downstream
+                if pose_smoother is not None:
+                    poses = pose_smoother.update(raw_poses, ema_tracks=person_tracks)
+                else:
+                    poses = raw_poses
                 if fall_det is not None:
                     fall_events = fall_det.update(
                         poses, frame_idx=frame_idx, t=time.perf_counter())
@@ -432,7 +467,26 @@ def run(config_path: str | None = None) -> None:
             for ev in phase4_events:
                 print(f"[phase4] {ev.event_type} frame={ev.frame_idx} {ev.details}")
 
-            # --- event logging (Phase 5 foundation) ---
+            # --- Phase 5D: skeleton-based fight detection ---
+            fight_events: list = []
+            if has_motion and fight_det is not None and router.should_run("fight", frame_idx):
+                fight_events = fight_det.detect(
+                    smooth_poses=poses, tracks=tracks,
+                    frame_idx=frame_idx, t=time.perf_counter()
+                )
+                for ev in fight_events:
+                    if clip_writer is not None:
+                        clip_path = clip_writer.flush_for_event(ev)
+                        if clip_path:
+                            print(f"[phase5d] FIGHT clip saved: {clip_path}")
+                    print(f"[phase5d] FIGHT tracks={ev.track_ids} "
+                          f"conf={ev.confidence:.2f} frame={ev.frame_idx}")
+
+            # --- Phase 5D: ClipWriter ring-buffer push (every frame) ---
+            if clip_writer is not None:
+                clip_writer.push(frame)
+
+            # --- event logging (Phase 5 foundation — SQLite per-event) ---
             if event_logger is not None:
                 for ev in phase4_events:
                     event_logger.log_event(ev, frame, frame_idx)
@@ -440,6 +494,40 @@ def run(config_path: str | None = None) -> None:
                     event_logger.log_event(ev, frame, frame_idx)
                 for ev in identity_events:
                     event_logger.log_event(ev, frame, frame_idx)
+
+            # --- Phase 5F: EventBuffer — aggregate + windowed JSON flush ---
+            if event_buffer is not None:
+                # Update per-track state for all visible person tracks
+                for tr in tracks:
+                    if getattr(tr, "cls", -1) != 0:
+                        continue
+                    tid = getattr(tr, "track_id", -1)
+                    if tid < 0:
+                        continue
+                    # Get pose_quality for this track if we have smoother
+                    pq = "missing"
+                    if pose_smoother is not None:
+                        pq = pose_smoother.get_quality(tid)
+                    event_buffer.update_track(
+                        track_id=tid, bbox=tr.xyxy,
+                        pose_quality=pq, frame_idx=frame_idx
+                    )
+                # Append all events from this frame
+                for ev in phase4_events:
+                    event_buffer.append(ev, frame_idx=frame_idx)
+                for ev in fall_events:
+                    event_buffer.append(ev, frame_idx=frame_idx)
+                for ev in identity_events:
+                    event_buffer.append(ev, frame_idx=frame_idx)
+                for ev in fight_events:
+                    event_buffer.append(ev, frame_idx=frame_idx)
+                # Timed JSON flush
+                flushed = event_buffer.maybe_flush(frame_idx=frame_idx)
+                if flushed is not None:
+                    n_tracks = len(flushed.get("tracks", []))
+                    n_scene  = len(flushed.get("scene_events", []))
+                    print(f"[phase5f] JSON flushed: {n_tracks} tracks, "
+                          f"{n_scene} scene events")
 
             # --- display ----------------------------------------------------
             if disp.get("enabled", True):

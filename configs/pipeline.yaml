@@ -63,9 +63,15 @@ router:
     violence:
       enabled: true
       every: 3            # every 3rd frame — needs temporal continuity, but cheaper than pose
+    fight:
+      enabled: true
+      every: 3            # same cadence as violence — skeleton-based, lightweight
     object_left:
       enabled: true
       every: 30           # 1 fps — track stationary objects
+    par:
+      enabled: false      # Phase 5B: PAR head (pending model download)
+      every: 10           # 3 fps — attribute extraction on crops
 
 features:
   detection: true
@@ -80,8 +86,25 @@ features:
   phone: true
   gathering: true
   violence: true
+  fight: true
   object_left: true
   event_logging: true
+  event_buffer: true      # Phase 5F: windowed JSON flush
+
+# --- Phase 5F: Windowed JSON event output ---
+output:
+  camera_id: cam_01
+  flush_interval_s: 10.0          # emit JSON blob every 10 seconds
+  json_dir: data/events_json      # written as events_cam_01_<timestamp>.json
+  max_track_age: 150              # frames to keep stale track records
+
+# --- Phase 5D: Clip Writer ---
+clip_writer:
+  enabled: true
+  clips_dir: data/clips
+  buffer_s: 5.0                   # 5 seconds of ring buffer
+  fps: 30.0
+  fourcc: mp4v
 
 perf:
   fps_warn_below: 20    # log a warning if sustained FPS drops below this
