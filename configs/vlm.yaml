@@ -1,0 +1,81 @@
+# ===== vlm.yaml =====
+# Configuration for Phase 6: VLM escalation layer.
+#
+# Phase 0 outcome: AWQ is unavailable on this platform (autoawq cannot be
+# installed; the upstream archive was abandoned). The VLM runs on the already-
+# downloaded Qwen2.5-VL-3B-Instruct (7.1 GB) with bitsandbytes NF4 4-bit
+# quantization (~2.3 GB loaded VRAM).  This is announced loudly at load time;
+# no silent substitution happens.
+#
+# What works in this revision:
+#   - Escalated pass: real model inference on detector-triggered frames.
+#   - Multi-frame context: VLMManager.update_frame_buffer is called every frame.
+#   - Persistence: escalated output written to `vlm_events` table in events.db.
+#   - Router gating: VLM call gated through router.should_run("vlm_escalated").
+#
+# What was removed (dead scaffolding):
+#   - Hot/warm/cold KV tiers (every block was pushed with keys=None).
+#   - SpatialTokenPruner (no production caller).
+#   - Ambient pass / encode_frame / _compute_attention_flag_PLACEHOLDER.
+#   - TemporalMerger (output consumed by nothing).
+#
+# VRAM budget: 6.0 GiB (RTX 4050 Laptop).
+# Target: full detector stack + 3B NF4 stays under 5.8 GiB.
+# Hard ceiling: model.max_vram_gb below. Load aborts if exceeded.
+
+model:
+  name: "Qwen/Qwen2.5-VL-3B-Instruct"   # 3B, fully downloaded (7.1 GB on disk)
+  device: "cuda:0"
+  half: true
+  dtype: "bfloat16"
+  max_pixels: 602112     # reduced from 1003520; cuts VRAM per frame at 3B
+  min_pixels: 3136
+  warmup_frame_height: 720
+  warmup_frame_width: 1280
+  max_vram_gb: 3.5       # hard ceiling: raise at load time if NF4 3B exceeds this
+                          # (measured: ~2.3 GB loaded; 3.5 gives headroom for inference peaks)
+
+  # Quantization: bitsandbytes NF4 (4-bit).
+  # AWQ was the preferred path but autoawq is unavailable on Windows with this
+  # torch build (archived upstream). NF4 is announced here; the load path prints
+  # the actual backend so a silent substitution cannot happen.
+  quantization: "nf4"    # "nf4" | "awq" | null (null = full bfloat16, will OOM at 3B)
+
+# Escalated pass - full fidelity processing triggered by detector events
+escalated:
+  max_tokens: 256         # reduced from 512; enough for entity list at 3B scale
+  context_window_frames: 15  # frames to include in escalation context window
+
+# Escalation thresholds
+escalation:
+  ambiguous_threshold_low: 0.3
+  ambiguous_threshold_high: 0.7
+  multi_frame_window: 1.5     # seconds of context to collect before escalating
+  forced_full_fidelity_interval: 150  # escalate unconditionally every N frames
+
+# Query engine (used for natural language queries against vlm_events table)
+query:
+  enabled: true
+  max_context_tokens: 2048    # reduced from 4096; keeps inference time bounded
+  generation_max_new_tokens: 256
+  temperature: 0.1
+  top_p: 0.9
+  default_prompt_template: |
+    You are a surveillance assistant. Answer questions about the video stream.
+    Use the retrieved context to provide accurate, grounded responses.
+    If something is not visible in the context, say so.
+
+    Context: {context}
+    Question: {query}
+    Answer:
+
+# Integration with existing pipeline
+integration:
+  use_existing_detector_as_priority: true
+  detector_escalation_weight: 0.8
+  log_vlm_events: true
+  vlm_event_db_table: "vlm_events"
+  # event_db_path is NOT redefined here — it is derived at runtime from
+  # configs/pipeline.yaml perf.event_db_path via vlm/config_paths.py so
+  # there is a single source of truth. Redefining it here was the bug that
+  # allowed silent divergence (vlm.yaml cold.event_db_path != pipeline.yaml).

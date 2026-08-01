@@ -82,17 +82,20 @@ fall:
 # OSNet-x0.25 (3x smaller, purpose-built for ReID) is the production target;
 # the architecture supports swapping it in by changing this config block.
 reid:
-  model: resnet18                        # resnet18 (dev) | osnet_x0_25 (production target)
+  model: osnet_x0_25                     # Phase 5.1: OSNet-x0.25 (torchreid).
+                                          # Trained on Market-1501 + DukeMTMC.
+                                          # Same-person cosine sim ≥ 0.95;
+                                          # different-person sim ≈ 0.3–0.5.
+                                          # Fallback: resnet18 (ImageNet, not ReID-trained)
   device: cuda:0
   half: true                             # FP16 on CUDA
-  imgsz: 128                             # ReID crops are small; 128 is standard
-  dim: 512                               # embedding dimension
-  match_threshold: 0.95                   # cosine sim above this = same person
-                                            # NOTE: 0.95 is conservative because ImageNet-pretrained
-                                            # ResNet18 features are not person-discriminative — same
-                                            # person scores ~0.99, different persons score ~0.94.
-                                            # OSNet (trained on ReID datasets) would allow 0.6-0.7.
+  imgsz: 256                             # OSNet standard crop height (256×128 tall portrait)
+  dim: 512                               # embedding dimension (same for both OSNet and ResNet18)
+  match_threshold: 0.65                   # Wide-margin threshold for OSNet (same-person ~0.95,
+                                          # different-person ~0.3–0.5 → 0.65 sits safely between).
+                                          # NOTE: if you revert to resnet18, raise this to 0.95.
   lost_ttl_s: 30.0                       # how long to keep lost-track embeddings for re-linking
+
 
 # --- Phase 3: Face Recognition ---
 # Uses insightface buffalo_s pack: SCRFD-500M (det) + MobileFaceNet (rec).
@@ -134,6 +137,9 @@ smoking:
   weights: models/smoking_yolov8n.pt       # cigarette/vape detection model
   conf: 0.25
   imgsz: 320
+  # Phase 5E: oscillation detection — require rhythmic hand rise/lower before YOLO confirm
+  min_oscillations: 2                      # minimum Y-velocity sign changes in gesture window
+  oscillation_window_frames: 30            # number of recent wrist positions to check
   # HSV fallback params (used only when YOLO model unavailable)
   min_object_area: 20
   glow_hsv_low: [0, 100, 200]
@@ -156,15 +162,39 @@ gathering:
   min_people: 3                           # minimum cluster size to trigger
   radius_pixels: 150                      # max distance between people in a cluster
   cooldown_s: 10.0                        # suppress re-trigger for the same cluster
+  sustained_s: 2.0                        # seconds count must exceed threshold before firing
+  sustained_frames: 5                     # DEPRECATED — converted to sustained_s at 30fps if sustained_s absent
 
-# --- Phase 4: Violence/Fighting Detection (heuristic placeholder — kept for fallback) ---
-# Phase 5D adds FightDetector which uses skeleton velocity signals.
-# Both run simultaneously; FightDetector emits FIGHT, ViolenceDetector emits VIOLENCE.
+
+# --- Phase 4: Violence Detection — ResNet50 binary classifier ---
+# Backbone : torchvision ResNet50 (IMAGENET1K_V2 pretrained)
+# Head     : Linear(2048 → 2) — index 0 = no_violence, index 1 = violence
+# Input    : full frame resized to 224×224, ImageNet-normalised (BGR→RGB)
+# Decision : rolling window of per-frame softmax confidences; fires VIOLENCE
+#            when ≥ min_sustained_frames in the last window_frames exceed
+#            conf_threshold, subject to cooldown_s suppression.
+#
+# To use fine-tuned weights (e.g., trained on UCF-Crime / RWF-2000):
+#   1. Set `weights` to the .pt checkpoint path
+#   2. The checkpoint may be a raw state_dict or {"model": state_dict}
+# If weights: null, ImageNet pretrained backbone is used (good for prototyping;
+# fine-tune for production-level precision/recall on complex violent scenes).
+#
+# Falls back to IoU+motion heuristic if torch/torchvision unavailable.
+# Phase 5D FightDetector (skeleton-based) runs in parallel; emits FIGHT.
 violence:
+  weights: null                   # null = ImageNet pretrained; set to path/to/violence_resnet50.pt
+  device: cuda:0
+  half: true                      # FP16 on CUDA — saves ~50 MB VRAM vs FP32
+  imgsz: 224                      # ResNet50 canonical input size
+  conf_threshold: 0.65            # per-frame softmax(violence) to count as "active"
+  window_frames: 10               # rolling deque length (at every:3, ≈1s of real frames)
+  min_sustained_frames: 4         # min frames in window above conf_threshold to fire
+  cooldown_s: 10.0                # suppress re-trigger for this many seconds after firing
+  # Legacy heuristic fallback params (used only when torch/torchvision unavailable)
   iou_threshold: 0.3
   motion_threshold: 40.0
   window_s: 1.5
-  cooldown_s: 10.0
 
 # --- Phase 5D: Skeleton-Based Fight Detection ---
 # Runs on smoothed poses from PoseSmoother (Phase 5A).
@@ -183,3 +213,12 @@ object_left:
   min_stationary_s: 30.0                # seconds object must be stationary
   position_variance_threshold: 100.0     # max variance in position to count as stationary
   cooldown_s: 60.0                       # suppress re-trigger for same object
+
+# --- Phase 5B: Pedestrian Attribute Recognition (PAR) ---
+par:
+  weights: null                          # uses default torchvision model / fallback
+  imgsz: 128
+  conf: 0.5
+  window_frames: 15
+  device: cuda:0
+  half: true

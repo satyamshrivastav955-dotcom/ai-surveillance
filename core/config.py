@@ -37,3 +37,26 @@ def load_models_config() -> dict[str, Any]:
 
 def load_pipeline_config() -> dict[str, Any]:
     return load_yaml("pipeline.yaml")
+
+
+def load_fps() -> float:
+    """The one authoritative frame rate for the whole pipeline.
+
+    Every module that needs to convert seconds <-> frames must take its FPS
+    from here (passed in explicitly by the caller); no module may assume 30.
+    Raises if `source.fps` is missing so a wrong-but-plausible rate can never
+    silently skew every time-based window in the system.
+    """
+    src = load_pipeline_config().get("source", {}) or {}
+    fps = src.get("fps")
+    if fps is None:
+        raise KeyError(
+            "[config] source.fps is not set in configs/pipeline.yaml. Frame-rate is "
+            "required to convert time windows into frame counts (fall/violence "
+            "sustain windows, fight history, VLM escalation buffers). Refusing to "
+            "assume 30 fps, which would silently mis-size every one of those windows."
+        )
+    fps = float(fps)
+    if fps <= 0:
+        raise ValueError(f"[config] source.fps must be > 0, got {fps}")
+    return fps

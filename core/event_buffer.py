@@ -80,16 +80,23 @@ class EventBuffer:
       camera_id        : identifier for this camera (default "cam_01")
       flush_interval_s : seconds between JSON flushes (default 10.0)
       json_dir         : directory to write JSON files (default "data/events_json")
-      max_track_age    : frames to keep a track record after last appearance
-                         (default 150 = ~5 seconds at 30fps)
+      max_track_age    : frames to keep a track record after last appearance.
+                         If unset, derived as max_track_age_s (default 5.0)
+                         times the real source.fps — not a hardcoded 150.
     """
 
-    def __init__(self, cfg: dict[str, Any] | None = None):
+    def __init__(self, cfg: dict[str, Any] | None = None, fps: float | None = None):
         cfg = cfg or {}
         self._camera_id       = str(cfg.get("camera_id",        "cam_01"))
         self._flush_interval  = float(cfg.get("flush_interval_s", 10.0))
         self._json_dir        = Path(cfg.get("json_dir",          "data/events_json"))
-        self._max_track_age   = int(cfg.get("max_track_age",      150))
+        if "max_track_age" in cfg:
+            self._max_track_age = int(cfg["max_track_age"])
+        else:
+            if fps is None:
+                from core.config import load_fps
+                fps = load_fps()
+            self._max_track_age = int(round(float(cfg.get("max_track_age_s", 5.0)) * float(fps)))
         self._json_dir.mkdir(parents=True, exist_ok=True)
 
         self._tracks: dict[int, _TrackRecord] = {}
@@ -133,7 +140,7 @@ class EventBuffer:
         t_clock = time.strftime("%H:%M:%S")
         etype = getattr(event, "event_type", "UNKNOWN")
 
-        if etype in ("FIRE", "SMOKE", "SMOKING", "PHONE", "FALL"):
+        if etype in ("FIRE", "SMOKE", "PHONE", "FALL"):
             # Per-track events
             details = getattr(event, "details", {})
             if isinstance(details, dict):
@@ -161,6 +168,28 @@ class EventBuffer:
             else:
                 # scene-level (fire/smoke without track)
                 self._scene_events.append({**evt_dict, "type": etype})
+
+        elif etype == "SMOKING":
+            # Per-track smoking with dedup within flush window
+            details = getattr(event, "details", {})
+            tid = details.get("track_id") if isinstance(details, dict) else None
+            if tid is None:
+                tid = getattr(event, "track_id", None)
+            dedup_key = f"SMOKING_{tid}"
+            if dedup_key not in self._dedup:
+                self._dedup[dedup_key] = {"first_t": t_clock}
+                conf = details.get("confidence") if isinstance(details, dict) else None
+                evt_dict = {
+                    "type": "SMOKING",
+                    "t": t_clock,
+                    "frame_idx": frame_idx,
+                }
+                if conf is not None:
+                    evt_dict["confidence"] = round(float(conf), 3)
+                if tid is not None:
+                    rec = self._tracks.setdefault(int(tid), _TrackRecord(track_id=int(tid)))
+                    rec.events.append(evt_dict)
+                    rec.last_seen = frame_idx
 
         elif etype == "GATHERING":
             details = getattr(event, "details", {})

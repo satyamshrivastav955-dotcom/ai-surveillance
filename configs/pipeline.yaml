@@ -2,6 +2,22 @@
 # Runtime behavior of the real-time loop. Every feature module is toggleable
 # here (constraint #6) so Phases 2+ get added without code changes to main_loop.
 
+# --- Bitchat mesh alert integration ---
+# Sends surveillance alerts and VLM scene descriptions to your Android phone
+# via Bitchat's mesh network.
+# Setup:
+#   1. Open Bitchat on Android → Settings → VLM API Settings → Enable
+#   2. Find your Android WiFi IP: Settings → WiFi → tap network → IP address
+#   3. Set ip below and flip enabled to true
+bitchat:
+  enabled: true             
+  ip: "10.99.134.211"       
+  port: 8765
+  # channel: "surveillance"  # Optional: uncomment to send to specific channel, otherwise uses default destination
+  rate_limit_s: 5.5
+  send_keyframes: true
+  send_scene: true
+
 source:
   type: webcam          # webcam | file | rtsp
   path: null            # used for `file` and `rtsp`
@@ -9,6 +25,10 @@ source:
   reconnect: true       # rtsp only — auto-reconnect
   width: 1280
   height: 720
+  fps: 30.0             # AUTHORITATIVE frame rate. Every module that converts
+                        # seconds <-> frames reads this via core.config.load_fps().
+                        # Must match the real capture rate of the source above —
+                        # if it doesn't, every time-based window is wrong.
 
 display:
   enabled: true
@@ -70,8 +90,16 @@ router:
       enabled: true
       every: 30           # 1 fps — track stationary objects
     par:
-      enabled: false      # Phase 5B: PAR head (pending model download)
+      enabled: true       # Phase 5B: PAR head (using default torchvision model / fallback)
       every: 10           # 3 fps — attribute extraction on crops
+
+    vlm_ambient:
+      enabled: true       # Phase 6: VLM ambient pass (runs on every frame)
+      every: 1            # Every frame — VLM vision encoder baseline
+    
+    vlm_escalated:
+      enabled: true       # Phase 6: VLM escalated pass (triggered by detector priority)
+      every: 1            # On-demand — runs when detector flags high priority
 
 features:
   detection: true
@@ -85,11 +113,21 @@ features:
   smoking: true
   phone: true
   gathering: true
-  violence: true
+  violence: false             # DISABLED: no trained weights (null in models.yaml).
+                              # ViolenceDetector with ImageNet ResNet50 + random Linear(2048,2)
+                              # head produces fabricated output. Re-enable with a real checkpoint.
   fight: true
   object_left: true
   event_logging: true
   event_buffer: true      # Phase 5F: windowed JSON flush
+  par: false                 # DISABLED: no trained weights (null in models.yaml).
+                              # PARDetector with ImageNet ResNet18 + random Linear(512,8)
+                              # head produces fabricated gender/hair/clothing output.
+                              # Re-enable with a real PAR checkpoint (e.g. PA-100K, RAP).
+  vlm: true               # Phase 6: VLM layer (ambient + escalated passes)
+  vlm_query: true         # Phase 6: Natural language query engine
+  vlm_verification: true  # Phase 6: Alert verification
+
 
 # --- Phase 5F: Windowed JSON event output ---
 output:

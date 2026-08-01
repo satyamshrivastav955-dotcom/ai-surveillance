@@ -1,18 +1,19 @@
-"""Person Re-Identification (Phase 3, Section 5).
+"""Person Re-Identification (Phase 3 / Phase 5.1).
 
 Lightweight body-embedding extraction + FAISS vector index for re-linking
 tracks across brief occlusions / re-entries.
 
-Model: torchvision ResNet18 with the final FC stripped — produces a 512-dim
-L2-normalized embedding from the avgpool layer. ResNet18 is ~11M params
-(same scale as YOLOv8n), well within the 6GB VRAM budget alongside the
-detector + pose models. OSNet-x0.25 (3x smaller, purpose-built for ReID) is
-the documented production target; the architecture supports swapping it in
-by changing configs/models.yaml.
+Backbone (Phase 5.1 upgrade):
+  OSNet-x0.25 (torchreid) — 2.2M params, purpose-built for ReID.
+  Trained on Market-1501 + DukeMTMC.  Same-person cosine sim ≥ 0.95;
+  different-person sim ≈ 0.3–0.5.  Comfortable threshold at 0.65.
 
-Per Section 4 of the build spec, embeddings are computed ONLY on new or
-re-appearing tracks — NOT every frame. This is gated by the FrameRouter
-(`reid: { every: 10 }` in pipeline.yaml), a huge VRAM/compute saver.
+  Fallback: ImageNet ResNet18 (strip FC) if OSNet unavailable.
+  Same-person sim ≈ 0.99; different-person sim ≈ 0.94 — razor's edge.
+
+Both backbones produce 512-dim L2-normalized embeddings compatible with the
+existing FAISS IndexFlatIP.  Switching backbones requires resetting the index
+(embeddings from different backbones are not comparable).
 
 FAISS is used for the local vector index (IndexFlatIP with L2-normalized
 embeddings = cosine similarity). Milvus is the planned production swap for
@@ -40,49 +41,171 @@ class ReIDMatch:
     identity_label: str | None      # propagated identity if the lost track had one
 
 
+def _build_osnet(device: str, half: bool) -> tuple[Any, int]:
+    """Build OSNet-x0.25 with Market-1501 + DukeMTMC ReID-trained weights.
+
+    Loads the model file directly via importlib to bypass torchreid's top-level
+    __init__ (which eagerly imports the training engine and requires tensorboard).
+
+    Weight loading priority:
+      1. ~/.cache/torch/checkpoints/osnet_x0_25_market_duke.pth  (ReID trained)
+      2. torchreid's pretrained_urls Google Drive download via init_pretrained_weights
+      3. ImageNet pretrained (pretrained=True) — degraded; no person-discriminative
+         signal (same limitation as ResNet18, different-person sim ≈ 0.94)
+
+    ReID-trained checkpoint: same-person sim ≥ 0.95, different-person sim ≈ 0.3–0.5.
+    Allows a comfortable match_threshold of 0.65 with a ~0.3 margin on each side.
+
+    Returns (model, feature_dim=512).
+    """
+    import importlib.util
+    import pathlib
+    import torch
+
+    # Locate osnet.py in the installed torchreid package (bypasses engine import)
+    try:
+        import torchreid as _tr_pkg
+        _tr_root = pathlib.Path(_tr_pkg.__file__).parent
+    except Exception:
+        import sysconfig
+        _tr_root = pathlib.Path(sysconfig.get_path("purelib")) / "torchreid"
+
+    osnet_path = _tr_root / "reid" / "models" / "osnet.py"
+    if not osnet_path.exists():
+        raise FileNotFoundError(f"[reid] osnet.py not found at {osnet_path}")
+
+    spec = importlib.util.spec_from_file_location("_osnet_mod", osnet_path)
+    osnet_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(osnet_mod)
+
+    # Build model without any pretrained weights first (we'll load manually)
+    model = osnet_mod.osnet_x0_25(num_classes=1, pretrained=False)
+
+    # Try to load the ReID-trained checkpoint from cache
+    reid_ckpt = pathlib.Path.home() / ".cache" / "torch" / "checkpoints" / "osnet_x0_25_market_duke.pth"
+    if reid_ckpt.exists():
+        state = torch.load(str(reid_ckpt), map_location="cpu", weights_only=False)
+        # torchreid checkpoints may be wrapped in {'state_dict': ...}
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        # strip 'module.' prefix added by DataParallel if present
+        state = {k.replace("module.", ""): v for k, v in state.items()}
+        # strip the classifier head — it was trained for N-way ID classification
+        # (e.g. 751 Market-1501 IDs) and is NEVER used in feature extraction.
+        # Removing it prevents size mismatch when model is built with num_classes=1.
+        state = {k: v for k, v in state.items() if not k.startswith("classifier")}
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[reid] Loaded ReID checkpoint: {reid_ckpt.name}  "
+              f"(missing={len(missing)}, unexpected={len(unexpected)})")
+
+    else:
+        # Fall back to torchreid's pretrained_urls download (Google Drive)
+        print(f"[reid] ReID checkpoint not found at {reid_ckpt}, "
+              f"falling back to torchreid pretrained download ...")
+        osnet_mod.init_pretrained_weights(model, "osnet_x0_25")
+
+    model.eval()
+    model = model.to(device)
+    if half:
+        model = model.half()
+    return model, model.feature_dim   # feature_dim == 512
+
+
+
+def _build_resnet18(device: str, half: bool, input_size: int) -> tuple[Any, int]:
+    """Fallback: stripped ResNet18 (ImageNet weights, FC replaced with Identity)."""
+    import torch
+    import torch.nn as nn
+    import torchvision.models as tvm
+
+    weights = tvm.ResNet18_Weights.DEFAULT if hasattr(tvm, "ResNet18_Weights") else None
+    backbone = tvm.resnet18(weights=weights)
+    backbone.fc = nn.Identity()   # strip FC → 512-dim avgpool features
+    backbone = backbone.to(device)
+    if half:
+        backbone = backbone.half()
+    backbone.eval()
+    return backbone, 512
+
+
 class ReIDExtractor:
     """Extracts 512-dim L2-normalized body embeddings from person crops.
 
-    Uses torchvision ResNet18 (strip FC, use avgpool features). FP16 on CUDA.
-    The model is lightweight enough that we don't bother with ONNX export for
-    now — ReID only runs on new/re-appearing tracks, not every frame.
+    Backbone is selected from configs/models.yaml ``reid.model``:
+
+    ``osnet_x0_25`` (default):
+        Purpose-built for ReID (trained on Market-1501/DukeMTMC).
+        Same-person sim ≥ 0.95, different-person sim ≈ 0.3–0.5.
+        Safe match_threshold: 0.65 (wide margin).
+        Crop size: 256 × 128 (tall portrait, standard for ReID).
+
+    ``resnet18``:
+        ImageNet backbone (general-purpose classifier, not ReID-trained).
+        Same-person sim ≈ 0.99, different-person sim ≈ 0.94 (razor's edge).
+        Requires match_threshold ≥ 0.95.
+        Crop size: imgsz × imgsz (square).
+
+    Both produce 512-dim L2-normalized embeddings — FAISS index is identical.
+    Switching backbones requires resetting the index (embeddings incompatible).
     """
 
     def __init__(self, cfg: dict[str, Any] | None = None):
         import torch
-        import torch.nn as nn
-        import torchvision.models as tvm
 
         self.cfg = cfg if cfg is not None else load_models_config()
         r = self.cfg.get("reid", {})
         self.device = r.get("device", "cuda:0")
         self.half = r.get("half", True)
-        self.input_size = r.get("imgsz", 128)   # ReID crops are small; 128 is standard
+        self.input_size = r.get("imgsz", 256)   # used only for ResNet18 fallback
 
-        # load ResNet18 with ImageNet pretrained weights, strip the FC
-        weights = tvm.ResNet18_Weights.DEFAULT if hasattr(tvm, "ResNet18_Weights") else None
-        backbone = tvm.resnet18(weights=weights)
-        backbone.fc = nn.Identity()    # replace final FC with identity -> 512-dim features
-        backbone = backbone.to(self.device)
-        if self.half:
-            backbone = backbone.half()
-        backbone.eval()
-        self.model = backbone
+        model_name = r.get("model", "osnet_x0_25").lower()
 
-        # warmup
-        dummy = torch.zeros(1, 3, self.input_size, self.input_size,
+        if model_name == "osnet_x0_25":
+            try:
+                self.model, self._feat_dim = _build_osnet(self.device, self.half)
+                self._backbone = "osnet_x0_25"
+                print(f"[reid] backbone=OSNet-x0.25  dim={self._feat_dim}  "
+                      f"device={self.device}  half={self.half}")
+            except Exception as e:
+                print(f"[reid] WARNING: OSNet-x0.25 load failed ({e}); "
+                      f"falling back to ResNet18. Match quality will be degraded.")
+                self.model, self._feat_dim = _build_resnet18(
+                    self.device, self.half, self.input_size)
+                self._backbone = "resnet18_fallback"
+                print(f"[reid] backbone=ResNet18 (fallback)  dim={self._feat_dim}")
+        else:
+            self.model, self._feat_dim = _build_resnet18(
+                self.device, self.half, self.input_size)
+            self._backbone = "resnet18"
+            print(f"[reid] backbone=ResNet18 (dev)  dim={self._feat_dim}  "
+                  f"device={self.device}  half={self.half}")
+
+        # Warmup — compile CUDA kernels so the first real crop is fast
+        _h = 256 if "osnet" in self._backbone else self.input_size
+        _w = 128 if "osnet" in self._backbone else self.input_size
+        dummy = torch.zeros(1, 3, _h, _w,
                             dtype=torch.float16 if self.half else torch.float32,
                             device=self.device)
         with torch.no_grad():
-            _ = backbone(dummy)
+            _ = self.model(dummy)
+
         self._transform = self._build_transform()
 
     def _build_transform(self):
-        """Standard ImageNet normalization + resize. Applied per-crop."""
+        """Per-crop preprocessing.
+
+        OSNet standard: 256 × 128 tall portrait crop (height × width).
+        ResNet18 fallback: square imgsz × imgsz crop.
+        Both use ImageNet mean/std normalization.
+        """
         import torchvision.transforms as T
+        if "osnet" in self._backbone:
+            resize = T.Resize((256, 128))
+        else:
+            resize = T.Resize((self.input_size, self.input_size))
         return T.Compose([
             T.ToPILImage(),
-            T.Resize((self.input_size, self.input_size)),
+            resize,
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406],
                         std=[0.229, 0.224, 0.225]),
@@ -91,21 +214,19 @@ class ReIDExtractor:
     def extract(self, crop_bgr: np.ndarray) -> np.ndarray | None:
         """Extract a 512-dim L2-normalized embedding from a BGR person crop.
 
-        Returns None if the crop is too small to be useful.
+        Returns None if the crop is too small (< 32 px tall or < 16 px wide).
         """
         import torch
         h, w = crop_bgr.shape[:2]
-        if h < 16 or w < 16:
+        if h < 32 or w < 16:
             return None
-        # BGR -> RGB for torchvision
-        crop_rgb = crop_bgr[:, :, ::-1].copy()
+        crop_rgb = crop_bgr[:, :, ::-1].copy()   # BGR → RGB
         tensor = self._transform(crop_rgb).unsqueeze(0).to(self.device)
         if self.half:
             tensor = tensor.half()
         with torch.no_grad():
-            feat = self.model(tensor)          # (1, 512)
+            feat = self.model(tensor)   # (1, 512)
         feat = feat.float().cpu().numpy().flatten()
-        # L2 normalize so cosine similarity = inner product
         norm = np.linalg.norm(feat)
         if norm < 1e-6:
             return None
@@ -141,8 +262,9 @@ class ReIDIndex:
         self.cfg = cfg if cfg is not None else load_models_config()
         r = self.cfg.get("reid", {})
         self.dim = r.get("dim", 512)
-        self.match_threshold = float(r.get("match_threshold", 0.6))
-        self.lost_ttl_s = float(r.get("lost_ttl_s", 30.0))   # how long to keep lost embeddings
+        self.match_threshold = float(r.get("match_threshold", 0.95))
+        print(f"[reid] match_threshold={self.match_threshold} (from {'config' if 'match_threshold' in r else 'default'})")
+        self.lost_ttl_s = float(r.get("lost_ttl_s", 30.0))
 
         self.index = faiss.IndexFlatIP(self.dim)
         # parallel arrays: track_id, is_lost, lost_at_timestamp, identity_label
@@ -219,12 +341,57 @@ class ReIDIndex:
         return ReIDMatch(new_track_id, matched_tid, best_sim, matched_label)
 
     def _prune_stale(self, t: float) -> None:
-        """Remove lost entries older than lost_ttl_s. We can't actually remove
-        from FAISS IndexFlatIP, so we just mark them as stale so they won't
-        be considered in try_relink."""
         for i in range(len(self._lost_at)):
             if self._is_lost[i] and self._lost_at[i] > 0 and (t - self._lost_at[i]) > self.lost_ttl_s:
-                self._lost_at[i] = 0.0  # stale -> won't be picked up
+                self._lost_at[i] = 0.0
+    
+    def rebuild_index(self) -> None:
+        """Rebuild the FAISS index to remove stale entries and free memory.
+        
+        FAISS IndexFlatIP doesn't support deletion, so we periodically rebuild
+        to remove accumulated stale entries.
+        """
+        import faiss
+
+        active_indices = []
+        active_embeddings = []
+        
+        for i in range(len(self._track_ids)):
+            if self._is_lost[i] and self._lost_at[i] == 0.0:
+                continue
+            if self._is_lost[i] and (time.perf_counter() - self._lost_at[i]) > self.lost_ttl_s:
+                continue
+            
+            active_indices.append(i)
+            try:
+                emb = self.index.reconstruct(i)
+                active_embeddings.append(emb)
+            except Exception:
+                continue
+        
+        if not active_embeddings:
+            # All entries are stale — replace with a fresh empty index.
+            import faiss as _faiss
+            self.index = _faiss.IndexFlatIP(self.dim)
+            self._track_ids.clear()
+            self._is_lost.clear()
+            self._lost_at.clear()
+            self._labels.clear()
+            return
+
+        
+        new_index = faiss.IndexFlatIP(self.dim)
+        new_index.add(np.array(active_embeddings, dtype=np.float32))
+        
+        self.index = new_index
+        self._track_ids = [self._track_ids[i] for i in active_indices]
+        self._is_lost = [self._is_lost[i] for i in active_indices]
+        self._lost_at = [self._lost_at[i] for i in active_indices]
+        self._labels = [self._labels[i] for i in active_indices]
+        
+    def get_index_size(self) -> int:
+        """Return the number of entries in the index."""
+        return self.index.ntotal
 
     def get_label(self, track_id: int) -> str | None:
         """Return the identity label for a track, if any."""

@@ -1,12 +1,9 @@
-"""Identity fusion (Phase 3, Section 3.3 of architecture doc).
+"""Identity fusion.
 
 When a face match succeeds, propagate that identity label onto the current
 track ID so the track keeps its identity even when the face isn't visible
 in later frames. When ReID re-links a new track to a lost track, propagate
 the old track's identity to the new one.
-
-This module is intentionally VLM-agnostic (constraint #5): it emits generic
-identity events that go to the event bus in Phase 5.
 """
 from __future__ import annotations
 
@@ -14,34 +11,47 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.events import BaseEvent
 from core.face import FaceMatch
 from core.reid import ReIDMatch
 
 
 @dataclass
-class IdentityEvent:
+class IdentityEvent(BaseEvent):
     """Emitted when a track's identity changes (face match, re-link, or loss)."""
-    event_type: str = "IDENTITY"  # for compatibility with EventLogger
     track_id: int = 0
-    label: str | None = None          # new label, or None if identity cleared
-    source: str = ""                # "face" | "reid" | "lost"
+    label: str | None = None
+    source: str = ""
     similarity: float = 0.0
-    matched_track_id: int | None = None   # for reid: the old track we matched
-    t_iso: str = ""
-    frame_idx: int = 0         # frame index for event logging
-    details: dict[str, Any] = field(default_factory=dict)
+    matched_track_id: int | None = None
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "event": "IDENTITY",
-            "track_id": self.track_id,
-            "label": self.label,
-            "source": self.source,
-            "similarity": round(self.similarity, 3),
-            "matched_track_id": self.matched_track_id,
-            "t_iso": self.t_iso,
-            "frame_idx": self.frame_idx,
-        }
+    def __init__(
+        self,
+        track_id: int = 0,
+        label: str | None = None,
+        source: str = "",
+        similarity: float = 0.0,
+        matched_track_id: int | None = None,
+        t_iso: str = "",
+        frame_idx: int = 0,
+    ):
+        super().__init__(
+            event_type="IDENTITY",
+            t_iso=t_iso,
+            frame_idx=frame_idx,
+            details={
+                "track_id": track_id,
+                "label": label,
+                "source": source,
+                "similarity": round(similarity, 3),
+                "matched_track_id": matched_track_id,
+            },
+        )
+        self.track_id = track_id
+        self.label = label
+        self.source = source
+        self.similarity = similarity
+        self.matched_track_id = matched_track_id
 
 
 class IdentityManager:
@@ -78,16 +88,13 @@ class IdentityManager:
             "confirmed_at": t,
             "similarity": match.similarity,
         }
-        import time as _t
         return IdentityEvent(
-            event_type="IDENTITY",
             track_id=tid,
             label=match.name,
             source="face",
             similarity=match.similarity,
-            t_iso=_t.strftime("%Y-%m-%dT%H:%M:%S"),
+            t_iso=time.strftime("%Y-%m-%dT%H:%M:%S"),
             frame_idx=frame_idx,
-            details={"track_id": tid, "label": match.name, "source": "face"},
         )
 
     def on_reid_relink(self, match: ReIDMatch, t: float | None = None,
@@ -116,17 +123,14 @@ class IdentityManager:
             "confirmed_at": t,
             "similarity": match.similarity,
         }
-        import time as _t
         return IdentityEvent(
-            event_type="IDENTITY",
             track_id=new_id,
             label=old["label"],
             source="reid",
             similarity=match.similarity,
             matched_track_id=old_id,
-            t_iso=_t.strftime("%Y-%m-%dT%H:%M:%S"),
+            t_iso=time.strftime("%Y-%m-%dT%H:%M:%S"),
             frame_idx=frame_idx,
-            details={"track_id": new_id, "label": old["label"], "source": "reid"},
         )
 
     def on_track_lost(self, track_id: int) -> IdentityEvent | None:

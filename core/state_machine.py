@@ -1,8 +1,6 @@
-"""Phase 2 fall-detection state machine (Section 5).
+"""Fall detection state machine.
 
-Rule-based and intentionally VLM-agnostic (constraint #5): emits generic
-FALL events that go to the event bus later in Phase 5 whether or not the
-VLM layer exists.
+Rule-based fall detection that emits FALL events.
 
 A fall is defined as the conjunction of three signals on a *single track*
 within a short window:
@@ -16,9 +14,7 @@ within a short window:
 
   AND (d) the track was *stably* upright for at least `min_upright_s`
       seconds before the transition — a single upright frame during
-      fidgeting does NOT re-arm the trigger (this is the key fix vs the
-      original implementation, which re-fired every few seconds when a
-      seated person shifted posture).
+      fidgeting does NOT re-arm the trigger.
 
 The window filters slow sitting-down: someone lowering themselves into a
 chair over 3-4 seconds should NOT trip the detector, but a person's centre
@@ -29,8 +25,7 @@ falls are tracked independently. Stale tracks are GC'd when not seen for
 a while.
 
 Debug: set env FALL_DEBUG=1 to log every TRIGGER and every "would-trigger-
-but-suppressed" event with the full signal breakdown (aspect, kp frac,
-upright duration, cooldown status). Useful for tuning thresholds.
+but-suppressed" event with the full signal breakdown.
 """
 from __future__ import annotations
 
@@ -41,6 +36,7 @@ from typing import Any
 
 import numpy as np
 
+from core.events import BaseEvent
 from core.pose import (
     KP_LEFT_HIP, KP_LEFT_SHOULDER, KP_RIGHT_HIP, KP_RIGHT_SHOULDER, Pose,
 )
@@ -50,43 +46,45 @@ _FALL_DEBUG_LIMIT = int(os.environ.get("FALL_DEBUG_LIMIT", "10"))
 
 
 @dataclass
-class FallEvent:
-    track_id: int
-    t_iso: str
-    frame_idx: int
-    aspect_now: float
-    keypoints_low: bool
-    kp_height_frac: float               # measured fraction at trigger time
-    upright_duration_s: float           # how long the track was upright before the fall
-    transition_delta_s: float           # time from last upright to fallen
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "event": "FALL",
-            "track_id": self.track_id,
-            "t_iso": self.t_iso,
-            "frame_idx": self.frame_idx,
-            "aspect_now": round(self.aspect_now, 3),
-            "keypoints_low": bool(self.keypoints_low),
-            "kp_height_frac": round(self.kp_height_frac, 3),
-            "upright_duration_s": round(self.upright_duration_s, 3),
-            "transition_delta_s": round(self.transition_delta_s, 3),
-        }
-
-    @property
-    def event_type(self) -> str:
-        return "FALL"
-
-    @property
-    def details(self) -> dict[str, Any]:
-        return {
-            "track_id": self.track_id,
-            "aspect_now": round(self.aspect_now, 3),
-            "keypoints_low": bool(self.keypoints_low),
-            "kp_height_frac": round(self.kp_height_frac, 3),
-            "upright_duration_s": round(self.upright_duration_s, 3),
-            "transition_delta_s": round(self.transition_delta_s, 3),
-        }
+class FallEvent(BaseEvent):
+    """Emitted when a fall is detected for a tracked person."""
+    track_id: int = 0
+    aspect_now: float = 0.0
+    keypoints_low: bool = False
+    kp_height_frac: float = 0.0
+    upright_duration_s: float = 0.0
+    transition_delta_s: float = 0.0
+    
+    def __init__(
+        self,
+        track_id: int,
+        t_iso: str,
+        frame_idx: int,
+        aspect_now: float,
+        keypoints_low: bool,
+        kp_height_frac: float,
+        upright_duration_s: float,
+        transition_delta_s: float,
+    ):
+        super().__init__(
+            event_type="FALL",
+            t_iso=t_iso,
+            frame_idx=frame_idx,
+            details={
+                "track_id": track_id,
+                "aspect_now": round(aspect_now, 3),
+                "keypoints_low": bool(keypoints_low),
+                "kp_height_frac": round(kp_height_frac, 3),
+                "upright_duration_s": round(upright_duration_s, 3),
+                "transition_delta_s": round(transition_delta_s, 3),
+            },
+        )
+        self.track_id = track_id
+        self.aspect_now = aspect_now
+        self.keypoints_low = keypoints_low
+        self.kp_height_frac = kp_height_frac
+        self.upright_duration_s = upright_duration_s
+        self.transition_delta_s = transition_delta_s
 
 
 

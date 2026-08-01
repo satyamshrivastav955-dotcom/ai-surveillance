@@ -42,15 +42,28 @@ class ClipWriter:
     Configuration (``clip_writer`` block in pipeline.yaml):
       clips_dir   : output directory (default "data/clips")
       buffer_s    : seconds of video to keep in the ring buffer (default 5.0)
-      fps         : frames-per-second of source (default 30.0)
       fourcc      : OpenCV FourCC codec string (default "mp4v")
+
+    Frame rate is NOT configured here — it is taken from the single
+    authoritative `source.fps`, so written clips can never play back at a
+    different rate than they were captured at.
     """
 
-    def __init__(self, cfg: dict[str, Any] | None = None):
+    def __init__(self, cfg: dict[str, Any] | None = None, fps: float | None = None):
         cfg = cfg or {}
         self._clips_dir = Path(cfg.get("clips_dir", "data/clips"))
         self._clips_dir.mkdir(parents=True, exist_ok=True)
-        self._fps    = float(cfg.get("fps",       30.0))
+        if fps is None:
+            from core.config import load_fps
+            fps = load_fps()
+        self._fps = float(fps)
+        if "fps" in cfg and float(cfg["fps"]) != self._fps:
+            print(
+                f"[clip_writer] WARN: ignoring clip_writer.fps={cfg['fps']} — it "
+                f"disagrees with the authoritative source.fps={self._fps}. Clips are "
+                f"written at {self._fps} fps. Remove clip_writer.fps from "
+                f"pipeline.yaml to silence this."
+            )
         self._buf_s  = float(cfg.get("buffer_s",  5.0))
         self._fourcc = cfg.get("fourcc", "mp4v")
         maxlen = int(self._fps * self._buf_s)

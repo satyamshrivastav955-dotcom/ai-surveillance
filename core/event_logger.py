@@ -27,7 +27,7 @@ class EventLogger:
         self.keyframes_dir = Path(keyframes_dir)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.keyframes_dir.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._create_schema()
 
     def _create_schema(self) -> None:
@@ -62,8 +62,12 @@ class EventLogger:
             keyframe_path = self._save_keyframe(event, frame, frame_idx)
 
         details_json = None
-        if hasattr(event, 'details'):
-            details_json = json.dumps(event.details)
+        details = getattr(event, 'details', None) or {}
+        if isinstance(details, dict):
+            details_json = json.dumps(details)
+
+        track_id = details.get("track_id") if isinstance(details, dict) else None
+        confidence = details.get("confidence") if isinstance(details, dict) else None
 
         self.conn.execute("""
             INSERT INTO events (t_iso, frame_idx, event_type, track_id, confidence, details_json, keyframe_path)
@@ -72,18 +76,19 @@ class EventLogger:
             event.t_iso,
             event.frame_idx,
             event.event_type,
-            event.details.get("track_id") if hasattr(event, 'details') else None,
-            event.details.get("confidence") if hasattr(event, 'details') else None,
+            track_id,
+            confidence,
             details_json,
             str(keyframe_path) if keyframe_path else None
         ))
         self.conn.commit()
 
     def _save_keyframe(self, event, frame: np.ndarray, frame_idx: int) -> Path | None:
-        """Save a keyframe image for the event."""
         try:
             t_safe = event.t_iso.replace(":", "-").replace(" ", "_")
-            filename = f"{event.event_type}_{t_safe}_f{frame_idx}_id{event.details.get('track_id', 'na')}.jpg"
+            details = getattr(event, 'details', None) or {}
+            track_id_str = str(details.get('track_id', 'na')) if isinstance(details, dict) else 'na'
+            filename = f"{event.event_type}_{t_safe}_f{frame_idx}_id{track_id_str}.jpg"
             path = self.keyframes_dir / filename
             cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             return path

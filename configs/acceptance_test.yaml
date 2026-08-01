@@ -1,0 +1,109 @@
+# ===== acceptance_test.yaml =====
+# Full pipeline config for Phase 6.2 acceptance test.
+# Identical to pipeline.yaml EXCEPT:
+#   display.enabled: false  (headless — no GUI during acceptance)
+#   features.vlm: false     (skip 30s model load; VLM tested separately)
+#   perf.max_frames: 200    (stop after 200 frames; self-terminating)
+#   perf.event_db_path: data/acceptance_events.db  (don't clobber production db)
+
+source:
+  type: webcam
+  path: null
+  loop: true
+  reconnect: true
+  width: 1280
+  height: 720
+  fps: 30.0
+
+display:
+  enabled: false         # headless for acceptance test
+
+motion_filter:
+  enabled: true
+  threshold: 0.01
+  min_changed_pixels: 1000
+
+router:
+  stages:
+    detect:
+      enabled: true
+      every: 1
+    track:
+      enabled: true
+      every: 1
+    pose:
+      enabled: true
+      every: 3
+    reid:
+      enabled: true
+      every: 15
+    face:
+      enabled: true
+      every: 8
+    fire_smoke:
+      enabled: true
+      every: 15
+    smoking:
+      enabled: true
+      every: 10
+    phone:
+      enabled: true
+      every: 10
+    gathering:
+      enabled: true
+      every: 30
+    violence:
+      enabled: true
+      every: 3
+    fight:
+      enabled: true
+      every: 3
+    object_left:
+      enabled: true
+      every: 30
+    par:
+      enabled: true
+      every: 10
+    vlm_ambient:
+      enabled: false     # VLM excluded from acceptance test
+    vlm_escalated:
+      enabled: false     # VLM excluded from acceptance test
+
+features:
+  detection: true
+  tracking: true
+  pose: true
+  fall_detection: true
+  reid: true
+  face: true
+  identity_fusion: true
+  fire_smoke: true
+  smoking: true
+  phone: true
+  gathering: true
+  violence: false        # DISABLED: no trained weights
+  fight: true
+  object_left: true
+  event_logging: true
+  event_buffer: true
+  par: false             # DISABLED: no trained weights
+  vlm: false             # EXCLUDED from acceptance test (30s load)
+  vlm_query: false
+  vlm_verification: false
+
+output:
+  camera_id: cam_01
+  flush_interval_s: 10.0
+  json_dir: data/acceptance_events_json
+  max_track_age: 150
+
+clip_writer:
+  enabled: false         # no clips during acceptance test
+
+perf:
+  fps_warn_below: 20
+  vram_warn_above_gb: 5
+  vram_log_every_s: 5
+  event_db_path: data/acceptance_events.db
+  keyframes_dir: data/acceptance_keyframes
+  max_frames: 200        # stop cleanly after 200 frames (~6.7s at 30fps)

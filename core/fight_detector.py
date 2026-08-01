@@ -1,44 +1,29 @@
-"""FightDetector — Phase 5D.
+"""FightDetector — Skeleton-based fight detection.
 
 Lightweight skeleton-based fight/violence detector that runs on the smoothed
-keypoint sequences from PoseSmoother (Phase 5A).
+keypoint sequences from PoseSmoother.
 
 Architecture
 ------------
-Instead of the full ST-GCN graph convolution (which requires mmaction2 / torch_geometric
-and a >100MB model download), we use a hand-crafted feature extractor over a
-30-frame sliding window of pairwise skeleton states, then classify with a
-rule-based threshold that captures the same kinematic signatures:
+Instead of the full ST-GCN graph convolution, we use a hand-crafted feature
+extractor over a sliding window of pairwise skeleton states:
 
-  1. Proximity — two tracked persons must be within ``proximity_px`` pixels
-     of each other (centroid distance).
-  2. Pairwise joint-velocity features — for each person, compute the per-frame
-     L2 displacement of the 8 "active" keypoints (wrists, elbows, shoulders,
-     ankles) over the sliding window.  High mean + high variance = thrashing
-     motion consistent with fighting.
-  3. Relative separation change — rate of change of centroid distance over the
-     window.  Alternating approach/retreat patterns are a fight signature.
-  4. Duration gate — signals (1-3) must all be sustained for ``window_s`` seconds
-     before the event fires.
+  1. Proximity — two tracked persons must be within `proximity_px` pixels
+  2. Pairwise joint-velocity features — high mean + high variance = thrashing
+  3. Relative separation change — alternating approach/retreat patterns
+  4. Duration gate — signals must be sustained for `window_s` seconds
 
 This is intentionally conservative: it will miss slow or clinched fights but
-avoids triggering on handshakes, hugs, and normal social proximity.  The
-``clip_ref`` field in the event allows a human reviewer to check every trigger.
+avoids triggering on handshakes, hugs, and normal social proximity.
 
-When ST-GCN weights become available (future Phase), the ``FightDetector.detect()``
-signature does not change — only the internal feature extractor and classifier
-are swapped out.
-
-Configuration (``fight`` block in models.yaml)
-----------------------------------------------
-  proximity_px        : max centroid distance for a "pair of interest" (default 200)
-  active_keypoints    : list of COCO keypoint indices to use for velocity features
-                        (default [5,6,7,8,9,10,15,16] = shoulders, elbows, wrists, ankles)
-  velocity_threshold  : mean per-joint velocity (px/frame) above which motion is "high"
-                        (default 15.0)
-  window_s            : must sustain all signals for this long (default 1.5)
-  cooldown_s          : suppress re-trigger for the same pair (default 10.0)
-  min_window_frames   : minimum history frames before classifier runs (default 15)
+Configuration (fight block in models.yaml)
+-------------------------------------------
+  proximity_px        : max centroid distance for a pair (default 200)
+  active_keypoints    : list of COCO keypoint indices for velocity (default shoulders, elbows, wrists, ankles)
+  velocity_threshold  : mean per-joint velocity threshold (default 15.0)
+  window_s            : sustain duration (default 1.5)
+  cooldown_s          : suppress re-trigger (default 10.0)
+  min_window_frames   : minimum history before classifier (default 15)
 """
 from __future__ import annotations
 
@@ -50,60 +35,71 @@ from typing import Any
 
 import numpy as np
 
-# Default active keypoints: shoulders(5,6), elbows(7,8), wrists(9,10), ankles(15,16)
+from core.events import BaseEvent
+
 _DEFAULT_ACTIVE_KP = [5, 6, 7, 8, 9, 10, 15, 16]
 
 
 @dataclass
-class FightEvent:
-    """Emitted when two tracks show sustained kinematic fight signatures.
-
-    Attributes
-    ----------
-    event_type     : always "FIGHT"
-    track_ids      : the two track IDs involved
-    t_iso          : ISO-format timestamp
-    frame_idx      : frame index at trigger
-    confidence     : heuristic confidence in [0, 1] (currently rule-based, so
-                     values are coarse: 0.6 low, 0.75 medium, 0.9 high)
-    clip_ref       : path to the 5-second clip (filled by ClipWriter if enabled)
-    details        : additional signal breakdown for debugging
-    """
-    event_type: str = "FIGHT"
+class FightEvent(BaseEvent):
+    """Emitted when two tracks show sustained kinematic fight signatures."""
     track_ids: tuple[int, int] = (0, 0)
-    t_iso: str = ""
-    frame_idx: int = 0
     confidence: float = 0.0
     clip_ref: str | None = None
-    details: dict[str, Any] = field(default_factory=dict)
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "event": "FIGHT",
-            "track_ids": list(self.track_ids),
-            "t_iso": self.t_iso,
-            "frame_idx": self.frame_idx,
-            "confidence": round(self.confidence, 3),
-            "clip_ref": self.clip_ref,
-            **self.details,
-        }
-
-    @property
-    def details_dict(self) -> dict[str, Any]:
-        return self.details
+    def __init__(
+        self,
+        track_ids: tuple[int, int],
+        t_iso: str,
+        frame_idx: int,
+        confidence: float,
+        clip_ref: str | None = None,
+        details: dict[str, Any] | None = None,
+    ):
+        super().__init__(
+            event_type="FIGHT",
+            t_iso=t_iso,
+            frame_idx=frame_idx,
+            details={
+                "track_ids": list(track_ids),
+                "confidence": round(confidence, 3),
+                "clip_ref": clip_ref,
+                **(details or {}),
+            },
+        )
+        self.track_ids = track_ids
+        self.confidence = confidence
+        self.clip_ref = clip_ref
 
 
 @dataclass
 class _PairState:
-    """Rolling state for one pair of tracks."""
+    """Rolling state for one pair of tracks.
+
+    Buffer length is `maxlen`, supplied by FightDetector from the real capture
+    rate (window_s * fps). It was a fixed 90 = 3s at an assumed 30 fps, which
+    covered the wrong amount of time at any other rate.
+    """
+    maxlen: int = 0
     contact_since: float = 0.0
-    velocity_a_buf: deque = field(default_factory=lambda: deque(maxlen=90))
-    velocity_b_buf: deque = field(default_factory=lambda: deque(maxlen=90))
-    dist_buf: deque = field(default_factory=lambda: deque(maxlen=90))
+    velocity_a_buf: deque = field(default_factory=deque)
+    velocity_b_buf: deque = field(default_factory=deque)
+    dist_buf: deque = field(default_factory=deque)
     last_kp_a: np.ndarray | None = None
     last_kp_b: np.ndarray | None = None
     last_fire_t: float = 0.0
     in_contact: bool = False
+
+    def __post_init__(self):
+        if self.maxlen <= 0:
+            raise ValueError(
+                "[FightDetector] _PairState.maxlen must be set from the real "
+                "capture rate (window_s * fps). Refusing to default to 90 frames, "
+                "which is only 3s if the source happens to run at 30 fps."
+            )
+        self.velocity_a_buf = deque(maxlen=self.maxlen)
+        self.velocity_b_buf = deque(maxlen=self.maxlen)
+        self.dist_buf = deque(maxlen=self.maxlen)
 
 
 class FightDetector:
@@ -114,14 +110,27 @@ class FightDetector:
     of :class:`FightEvent`.
     """
 
-    def __init__(self, cfg: dict[str, Any] | None = None):
+    def __init__(self, cfg: dict[str, Any] | None = None, fps: float | None = None):
         cfg = cfg or {}
         self._proximity_px    = float(cfg.get("proximity_px",      200.0))
         self._active_kp       = list(cfg.get("active_keypoints",   _DEFAULT_ACTIVE_KP))
         self._vel_thresh      = float(cfg.get("velocity_threshold", 15.0))
         self._window_s        = float(cfg.get("window_s",           1.5))
         self._cooldown_s      = float(cfg.get("cooldown_s",         10.0))
-        self._min_frames      = int(cfg.get("min_window_frames",    15))
+
+        # Frame-rate comes from the caller or, failing that, the single
+        # authoritative pipeline value. Never assumed locally.
+        if fps is None:
+            from core.config import load_fps
+            fps = load_fps()
+        self._fps = float(fps)
+
+        # Rolling buffers hold `buffer_s` seconds of samples (was a fixed 90).
+        self._buffer_s        = float(cfg.get("buffer_s",           3.0))
+        self._buf_len         = max(2, int(round(self._buffer_s * self._fps)))
+        # Minimum samples before a verdict is valid: window_s of data.
+        self._min_frames      = int(cfg.get("min_window_frames",
+                                            max(2, int(round(self._window_s * self._fps)))))
 
         # per-pair state keyed by (min_id, max_id)
         self._pairs: dict[tuple[int, int], _PairState] = {}
@@ -182,7 +191,8 @@ class FightDetector:
                 cb = centroids[id_b]
                 dist = float(np.hypot(ca[0] - cb[0], ca[1] - cb[1]))
 
-                ps = self._pairs.setdefault(key, _PairState(contact_since=t))
+                ps = self._pairs.setdefault(
+                    key, _PairState(maxlen=self._buf_len, contact_since=t))
 
                 # --- Proximity gate ---
                 in_proximity = dist <= self._proximity_px

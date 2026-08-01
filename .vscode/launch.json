@@ -1,0 +1,48 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "🚀 Run AI Surveillance Pipeline (Webcam / Default)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pipeline.main_loop",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "🐛 Debug Phone Detection (PHONE_DEBUG=1)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pipeline.main_loop",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PHONE_DEBUG": "1"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "🐛 Debug Fall Detection (FALL_DEBUG=1)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pipeline.main_loop",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "FALL_DEBUG": "1"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "🧪 Run All Pytest Suites",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["tests/", "-v"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

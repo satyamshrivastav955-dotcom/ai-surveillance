@@ -17,6 +17,7 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -86,17 +87,39 @@ def test_no_fire_on_blank():
 
 
 def test_smoking_detection():
-    """Smoking glow heuristic should flag a bright spot near a person."""
+    """Smoking detection: Stage 1 (gesture) + Stage 2 (glow confirmation)."""
     from core.events import SmokingDetector
     import cv2
     det = SmokingDetector({"min_object_area": 10})
-    # make a 200x200 frame with a glow in the UPPER portion (face/hand area)
+    
+    # 200x200 frame with a glow in the upper portion
     frame = np.zeros((200, 200, 3), dtype=np.uint8)
     cv2.circle(frame, (100, 50), 8, (0, 120, 255), -1)  # bright orange glow near top
-    tr = FakeTrack(1, 0, (0, 0, 200, 200))
-    events = det.detect(frame, [tr], frame_idx=0)
+
+    tr = FakeTrack(1, 0, (0, 0, 200, 200)) # height = 200, 0.15*H = 30px
+    
+    # Pose: left wrist close to nose (within 10px, < 30px)
+    class FakePose:
+        def __init__(self, tid, keypoints):
+            self.track_id = tid
+            self.keypoints = keypoints
+            self.conf = 0.9
+
+    keypoints = np.zeros((17, 3), dtype=np.float32)
+    keypoints[0] = [100.0, 50.0, 0.9]  # nose
+    keypoints[9] = [100.0, 55.0, 0.9]  # left wrist
+    keypoints[10] = [0.0, 0.0, 0.0]    # right wrist
+    pose = FakePose(1, keypoints)
+
+    # First call: gesture starts
+    det.detect(frame, [tr], [pose], frame_idx=0, t=100.0)
+    # Second call: 3 seconds later (>= 2.0s), triggers detection
+    events = det.detect(frame, [tr], [pose], frame_idx=1, t=103.0)
+    
     assert len(events) >= 1, f"FAIL: expected SMOKING event, got {len(events)}"
-    print(f"  [ok] smoking detected: glow_area={events[0].details['glow_area']}")
+    assert events[0].details["class"] == "glow"
+    print(f"  [ok] smoking detected via two-stage process: duration={events[0].details['duration_s']}s")
+
 
 
 def test_gathering_triggers():
@@ -127,50 +150,106 @@ def test_gathering_no_trigger_with_2():
     print(f"  [ok] no gathering with only 2 people")
 
 
-def test_violence_triggers():
-    """Overlapping bboxes + rapid relative motion should trigger VIOLENCE."""
+def test_violence_raises_without_weights():
+    """ViolenceDetector must raise when violence.weights is null.
+
+    Previously it built an ImageNet ResNet50 + random Linear(2048,2) head,
+    ran softmax, and emitted VIOLENCE events from random scores.  Now it raises
+    RuntimeError so the pipeline's stage() guard can catch it and disable
+    the violence stage without crashing the rest of the pipeline.
+    """
     from core.events import ViolenceDetector
-    import time as _time
-    det = ViolenceDetector({"iou_threshold": 0.05, "motion_threshold": 10.0,
-                            "window_s": 0.1, "cooldown_s": 0})
-    # frame 0: two people overlapping, at positions A and B
+    with pytest.raises(RuntimeError, match="REFUSING TO LOAD"):
+        ViolenceDetector({"weights": None, "cooldown_s": 0})
+
+
+def test_violence_raises_when_weights_file_missing():
+    """A non-existent weights file must raise, not silently use ImageNet."""
+    from core.events import ViolenceDetector
+    with pytest.raises(RuntimeError, match="weights file not found|REFUSING TO LOAD"):
+        ViolenceDetector({"weights": "/nonexistent/violence.pt", "cooldown_s": 0})
+
+
+def test_violence_heuristic_method_works():
+    """_detect_heuristic still works for unit-testing the IoU+motion logic.
+
+    The heuristic is only reached when torch/torchvision is unavailable.
+    We test it directly here rather than through __init__ which now raises.
+    """
+    import importlib
+    import sys
+    from core import events as _ev
+
+    # Build a detector without going through __init__ so we can test
+    # _detect_heuristic in isolation.
+    det = object.__new__(_ev.ViolenceDetector)
+    det.cfg = {"iou_threshold": 0.05, "motion_threshold": 10.0,
+               "window_s": 0.1, "cooldown_s": 0}
+    det.iou_threshold    = float(det.cfg.get("iou_threshold",   0.3))
+    det.motion_threshold = float(det.cfg.get("motion_threshold", 40.0))
+    det.window_s         = float(det.cfg.get("window_s",         1.5))
+    det.cooldown_s       = float(det.cfg.get("cooldown_s",       10.0))
+    det._pair_state      = {}
+    det._model           = None
+    det.method           = "heuristic_fallback"
+    from collections import deque
+    det._conf_window    = deque(maxlen=10)
+    det._last_fire_t    = 0.0
+    det._conf_threshold = 0.65
+    det._min_sustained  = 4
+    det._window_frames  = 10
+
+    # frame 0: two overlapping tracks
     t0 = 100.0
-    tracks0 = [
-        FakeTrack(1, 0, (100, 100, 200, 250)),
-        FakeTrack(2, 0, (150, 100, 250, 250)),   # overlaps with track 1
-    ]
-    det.detect(tracks0, frame_idx=0, t=t0)
-    # frame 1: 0.2s later, both have moved significantly
-    tracks1 = [
-        FakeTrack(1, 0, (130, 100, 230, 250)),   # moved 30px right
-        FakeTrack(2, 0, (120, 100, 220, 250)),   # moved 30px left
-    ]
-    events = det.detect(tracks1, frame_idx=1, t=t0 + 0.2)
-    # should fire because sustained contact + rapid motion over >window_s
-    assert len(events) >= 1, f"FAIL: expected VIOLENCE event, got {len(events)}"
-    print(f"  [ok] violence detected: iou={events[0].details['iou']} "
-          f"motion={events[0].details['rel_motion']}")
-
-
-def test_violence_no_trigger_slow_motion():
-    """Overlapping bboxes but SLOW motion should NOT trigger violence."""
-    from core.events import ViolenceDetector
-    det = ViolenceDetector({"iou_threshold": 0.05, "motion_threshold": 50.0,
-                            "window_s": 0.1, "cooldown_s": 0})
-    t0 = 200.0
-    # two people overlapping, barely moving
     tracks0 = [
         FakeTrack(1, 0, (100, 100, 200, 250)),
         FakeTrack(2, 0, (150, 100, 250, 250)),
     ]
-    det.detect(tracks0, frame_idx=0, t=t0)
+    det._detect_heuristic(tracks0, frame_idx=0, t=t0)
+    # frame 1: 0.2s later, rapid motion
     tracks1 = [
-        FakeTrack(1, 0, (102, 100, 202, 250)),   # moved only 2px
+        FakeTrack(1, 0, (130, 100, 230, 250)),
+        FakeTrack(2, 0, (120, 100, 220, 250)),
+    ]
+    events = det._detect_heuristic(tracks1, frame_idx=1, t=t0 + 0.2)
+    assert len(events) >= 1, f"FAIL: expected VIOLENCE event, got {len(events)}"
+    print(f"  [ok] violence heuristic (direct): iou={events[0].details['iou']}")
+
+
+def test_violence_heuristic_no_trigger_slow_motion():
+    """Overlapping bboxes but SLOW motion should NOT trigger via heuristic."""
+    from core import events as _ev
+    det = object.__new__(_ev.ViolenceDetector)
+    det.cfg = {"iou_threshold": 0.05, "motion_threshold": 50.0,
+               "window_s": 0.1, "cooldown_s": 0}
+    det.iou_threshold    = 0.05
+    det.motion_threshold = 50.0
+    det.window_s         = 0.1
+    det.cooldown_s       = 0.0
+    det._pair_state      = {}
+    det._model           = None
+    det.method           = "heuristic_fallback"
+    from collections import deque
+    det._conf_window    = deque(maxlen=10)
+    det._last_fire_t    = 0.0
+    det._conf_threshold = 0.65
+    det._min_sustained  = 4
+    det._window_frames  = 10
+
+    t0 = 200.0
+    tracks0 = [
+        FakeTrack(1, 0, (100, 100, 200, 250)),
+        FakeTrack(2, 0, (150, 100, 250, 250)),
+    ]
+    det._detect_heuristic(tracks0, frame_idx=0, t=t0)
+    tracks1 = [
+        FakeTrack(1, 0, (102, 100, 202, 250)),
         FakeTrack(2, 0, (152, 100, 252, 250)),
     ]
-    events = det.detect(tracks1, frame_idx=1, t=t0 + 0.2)
+    events = det._detect_heuristic(tracks1, frame_idx=1, t=t0 + 0.2)
     assert len(events) == 0, f"FAIL: slow motion triggered violence ({len(events)})"
-    print(f"  [ok] no violence with slow motion")
+    print(f"  [ok] no violence with slow motion (heuristic direct)")
+
 
 
 def test_phone_detection():
@@ -200,8 +279,10 @@ def main():
     test_smoking_detection()
     test_gathering_triggers()
     test_gathering_no_trigger_with_2()
-    test_violence_triggers()
-    test_violence_no_trigger_slow_motion()
+    test_violence_raises_without_weights()
+    test_violence_raises_when_weights_file_missing()
+    test_violence_heuristic_method_works()
+    test_violence_heuristic_no_trigger_slow_motion()
     test_phone_detection()
     print("phase4_test: all passed")
 

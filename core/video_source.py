@@ -1,16 +1,28 @@
-"""Video input abstraction (Phase 1, Section 5).
+"""Video input abstraction.
 
 All sources expose the same `read() -> (ret, frame)` interface so every
-downstream module is source-agnostic. `RTSPSource` is a working stub — it
-plugs into a real IP camera later via a config change, not a refactor.
+downstream module is source-agnostic.
 """
 from __future__ import annotations
 
+import sys
 import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 import cv2
+
+
+def _get_preferred_backend() -> int:
+    """Get platform-appropriate video backend."""
+    if sys.platform == "win32":
+        return cv2.CAP_DSHOW
+    elif sys.platform == "linux":
+        return cv2.CAP_V4L2
+    elif sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
+    return cv2.CAP_ANY
 
 
 class VideoSource(ABC):
@@ -42,7 +54,6 @@ class VideoSource(ABC):
         if self.height:
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
 
-    # context-manager sugar so `with WebcamSource() as src:` is valid
     def __enter__(self) -> "VideoSource":
         self.open()
         return self
@@ -52,42 +63,68 @@ class VideoSource(ABC):
 
 
 class WebcamSource(VideoSource):
-    """Laptop webcam — honest live read on real-time performance."""
+    """Laptop webcam with retry logic."""
 
-    def __init__(self, index: int = 0, width: int | None = 1280, height: int | None = 720):
+    def __init__(self, index: int = 0, width: int | None = 1280, height: int | None = 720, max_retries: int = 3):
         super().__init__(width, height)
         self.index = index
+        self.max_retries = max_retries
+        self._consecutive_failures = 0
 
     def open(self) -> None:
-        # CAP_DSHOW avoids the slow MSMF warmup on Windows
-        self.cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
+        backend = _get_preferred_backend()
+        self.cap = cv2.VideoCapture(self.index, backend)
         self._apply_resolution()
         if not self.isOpened():
             raise RuntimeError(f"Could not open webcam index {self.index}")
 
     def read(self) -> tuple[bool, Any]:
-        return self.cap.read()
+        ok, frame = self.cap.read()
+        
+        if not ok:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.max_retries:
+                return False, None
+            return False, None
+        
+        self._consecutive_failures = 0
+        return True, frame
 
 
 class FileSource(VideoSource):
-    """Recorded video — repeatable accuracy tests; loops by default."""
+    """Recorded video with loop support and corrupt frame handling."""
 
     def __init__(self, path: str, loop: bool = True, width: int | None = None, height: int | None = None):
         super().__init__(width, height)
-        self.path = path
+        self.path = Path(path)
         self.loop = loop
+        self._consecutive_failures = 0
+        self._max_consecutive_failures = 10
 
     def open(self) -> None:
-        self.cap = cv2.VideoCapture(self.path)
+        self.cap = cv2.VideoCapture(str(self.path))
         if not self.isOpened():
             raise FileNotFoundError(f"Could not open video file: {self.path}")
         self._apply_resolution()
 
     def read(self) -> tuple[bool, Any]:
         ok, frame = self.cap.read()
-        if not ok and self.loop:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ok, frame = self.cap.read()
+        
+        if not ok:
+            self._consecutive_failures += 1
+            
+            if self.loop and self._consecutive_failures < self._max_consecutive_failures:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = self.cap.read()
+                if ok:
+                    self._consecutive_failures = 0
+            
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                return False, None
+        
+        if ok:
+            self._consecutive_failures = 0
+            
         return ok, frame
 
 
@@ -181,18 +218,26 @@ class SyntheticSource(VideoSource):
 
 
 class RTSPSource(VideoSource):
-    """IP camera stub. Untested on real hardware in Phase 1 but ready to use.
+    """IP camera with exponential backoff reconnection."""
 
-    Uses a TCP transport + low-latency buffer to reduce frame jitter. Set
-    `source.type: rtsp` and `source.path: rtsp://user:pass@ip/stream` in
-    pipeline.yaml to enable.
-    """
-
-    def __init__(self, url: str, reconnect: bool = True, width: int | None = None, height: int | None = None):
+    def __init__(
+        self,
+        url: str,
+        reconnect: bool = True,
+        width: int | None = None,
+        height: int | None = None,
+        max_retries: int = 10,
+        initial_backoff: float = 0.5,
+        max_backoff: float = 30.0,
+    ):
         super().__init__(width, height)
         self.url = url
         self.reconnect = reconnect
-        self._backoff = 0.5
+        self.max_retries = max_retries
+        self._backoff = initial_backoff
+        self._initial_backoff = initial_backoff
+        self._max_backoff = max_backoff
+        self._retry_count = 0
 
     def open(self) -> None:
         self._open_internal()
@@ -202,17 +247,30 @@ class RTSPSource(VideoSource):
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not self.isOpened():
             raise RuntimeError(f"Could not open RTSP stream: {self.url}")
+        self._retry_count = 0
+        self._backoff = self._initial_backoff
 
     def read(self) -> tuple[bool, Any]:
+        if self.cap is None:
+            return False, None
+            
         ok, frame = self.cap.read()
-        if not ok and self.reconnect:
-            time.sleep(self._backoff)
-            self.release()
-            try:
-                self._open_internal()
-                ok, frame = self.cap.read()
-            except RuntimeError:
-                ok = False
+        
+        if not ok:
+            frame = None
+            if self.reconnect:
+                self._retry_count += 1
+                if self._retry_count <= self.max_retries:
+                    time.sleep(self._backoff)
+                    self._backoff = min(self._backoff * 2, self._max_backoff)
+                    self.release()
+                    try:
+                        self._open_internal()
+                        ok, frame = self.cap.read()
+                    except (RuntimeError, Exception):
+                        ok = False
+                        frame = None
+        
         return ok, frame
 
 
@@ -234,6 +292,13 @@ def build_source(source_cfg: dict[str, Any]) -> VideoSource:
             raise ValueError("source.type=rtsp requires source.path")
         return RTSPSource(path, reconnect=source_cfg.get("reconnect", True), width=width, height=height)
     if kind == "synthetic":
-        fps = float(source_cfg.get("fps", 30.0))
+        if "fps" not in source_cfg:
+            raise KeyError(
+                "[video_source] source.fps is required for a synthetic source. "
+                "Refusing to default to 30 fps, which would make the synthetic "
+                "stream run at a different rate than every time-based window in "
+                "the pipeline assumes."
+            )
+        fps = float(source_cfg["fps"])
         return SyntheticSource(fps=fps, width=width or 1280, height=height or 720)
     raise ValueError(f"Unknown source type: {kind}")

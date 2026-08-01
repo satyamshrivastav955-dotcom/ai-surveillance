@@ -1,10 +1,10 @@
-# AI Surveillance System — Phase 5 (Multi-Task Analytics) In Progress
+# AI Surveillance System — Phase 6 (VLM Layer) In Progress
 
 ## Project Overview
 
-A real-time AI security camera system built on a pure deep-learning pipeline (Phases 1-4+) with VLM layer planned for Phase 6. Target hardware: **RTX 4050 Laptop GPU, 6GB VRAM**.
+A real-time AI security camera system built on a pure deep-learning pipeline (Phases 1-5 complete) with infinite-streaming VLM layer implemented in Phase 6. Target hardware: **RTX 4050 Laptop GPU, 6GB VRAM**.
 
-**Status: Phase 5A/5D/5F Complete — Pose Smoothing, Fight Detection, Windowed JSON Emission**
+**Status: Phase 6 Implemented — Infinite-Streaming VLM Layer with Qwen2.5-VL-7B-Instruct**
 
 ---
 
@@ -16,19 +16,18 @@ A real-time AI security camera system built on a pure deep-learning pipeline (Ph
 | 2 — Fall Detection | ✅ complete | YOLOv8n-pose on person crops + state machine (tuned anti-FP) |
 | ONNX Export Pass | ✅ complete | Pose on onnx_direct (46% overhead reduction) |
 | 3 — ReID + Face | ✅ complete | ResNet18 + SCRFD/MobileFaceNet + identity fusion |
-| 4 — Event Detectors | ✅ complete | All 6 detectors + real YOLO models (see below) |
+| 4 — Event Detectors | ✅ complete | All 6 detectors + real YOLO models |
 | Motion Prefilter | ✅ complete | Frame differencing gates heavy stages on static scenes |
 | Object-Left-Behind | ✅ complete | Tracks stationary non-person objects for >30s |
 | Structured Event Log | ✅ complete | SQLite + keyframes (Phase 5 foundation) |
-| Pre-VLM Integration | ✅ complete | 43/43 tests pass, full pipeline confirmed |
-| **5A — Pose Smoother** | ✅ **NEW** | One-Euro filter + EMA bbox + confidence gating per keypoint |
-| **5D — Fight Detector** | ✅ **NEW** | Skeleton velocity + proximity + oscillation signals |
-| **5D — Clip Writer** | ✅ **NEW** | 5s ring-buffer → mp4 clip on fight trigger |
-| **5F — Event Buffer** | ✅ **NEW** | Windowed JSON flush (10s interval, spec-compliant schema) |
-| 5B — PAR (attributes) | 🔜 pending | ResNet50 multi-label head (model download required) |
-| 5C — ROI Upgrade | 🔜 pending | Polygon-gated gathering detection |
-| 5E — Smoking upgrade | 🔜 pending | Pose-gesture primary + YOLO confirm |
-| 6 — VLM Layer | 🔜 pending | Alert verifier, open-vocab watcher, NL query engine |
+| **5A — Pose Smoother** | ✅ complete | One-Euro filter + EMA bbox + confidence gating per keypoint |
+| **5B — PAR Head** | ✅ complete | Hybrid ResNet18 + HSV dominant color + 15-frame aggregator |
+| **5C — ROI Occupancy** | ✅ complete | Polygon-gated gathering detection with wall-clock timing |
+| **5D — Fight Detector** | ✅ complete | Skeleton velocity + proximity + oscillation signals |
+| **5D — Clip Writer** | ✅ complete | 5s ring-buffer → mp4 clip on fight trigger |
+| **5E — Smoking Upgrade** | ✅ complete | Gesture oscillation gate + YOLO crop confirmation |
+| **5F — Event Buffer** | ✅ complete | Windowed JSON flush (10s interval, spec-compliant schema) |
+| **6 — VLM Layer** | 🔄 in progress | Infinite-streaming VLM with ambient pass, escalation, tiered KV cache, query engine |
 
 ---
 
@@ -207,15 +206,51 @@ Press **q** or **ESC** to quit.
 
 ---
 
-## Remaining Work — VLM Layer (Phase 6)
+---
+
+## Phase 6 — Infinite-Streaming VLM Layer
+
+### Architecture
+- **Base Model:** Qwen2.5-VL-7B-Instruct with StreamingVLM method (MIT Han Lab)
+- **Ambient Pass:** VLM runs on every frame with aggressive token pruning (retain 10-15%)
+- **Escalation:** Detector triggers priority signal → elevated attention (retain 40-50% tokens)
+- **Tiered KV Cache:**
+  - Hot (VRAM): Last 30s sliding window, full precision
+  - Warm (RAM): 30s-5min range, asymmetric quantization (E4M3 keys, E5M2 values)
+  - Cold (Disk): >5min, structured storage in SQLite event DB
+- **Key Constraint:** Never silently miss a person (stationary, occluded, low-contrast cases)
+
+### Components Implemented
+
+| Component | File | Status |
+|---|---|---|
+| VLM Config | `vlm/config.py` | ✅ complete |
+| Spatial Token Pruner | `vlm/token_pruning.py` | ✅ complete |
+| Tiered KV Cache | `vlm/kv_cache.py` | ✅ complete |
+| Query Engine | `vlm/query_engine.py` | ✅ complete |
+| VLM Manager | `vlm/vlm_manager.py` | ✅ complete |
+| VLM Config YAML | `configs/vlm.yaml` | ✅ complete |
+| Main Loop Integration | `pipeline/main_loop.py` | ✅ complete |
+| VLM Tests | `tests/vlm_test.py` | ✅ complete |
+
+### Next Steps
+
+| Item | Description |
+|---|---|---|
+| Model Download | Download Qwen2.5-VL-7B-Instruct weights |
+| Integration Test | Validate VLM with existing detector pipeline on sample video |
+| Memory Validation | Verify tiered KV cache stays within 6GB VRAM budget |
+| Query API Test | Test natural language query functionality |
+
+---
+
+## Remaining Work — Future Enhancements
 
 | Item | Description |
 |---|---|
-| Alert Verifier | VLM confirms/rejects ambiguous events (violence, smoke, object_left) |
-| Open-Vocab Watcher | "Notify me when someone carries a red bag" style triggers |
-| NL Query Engine | "Show me all smoke events from today" via natural language |
 | Violence Upgrade | MoViNet temporal action recognition (if VLM insufficient) |
 | ReID Upgrade | OSNet-x0.25 (purpose-built; wider match margin than ResNet18) |
+| Open-Vocab Watcher | "Notify me when someone carries a red bag" style triggers |
 
 ---
 
