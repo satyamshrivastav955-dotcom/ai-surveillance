@@ -1,0 +1,60 @@
+QUICK START - Enable Bitchat WiFi Access
+=========================================
+
+CURRENT STATUS:
+- Code is FIXED and READY
+- Config updated to WiFi IP: 10.108.31.151
+- Port 8765 is CLOSED on WiFi (needs configuration)
+
+
+WHAT YOU NEED TO DO:
+====================
+
+1. OPEN Bitchat app on Android
+
+2. GO TO Settings -> VLM API Settings
+
+3. LOOK FOR ONE OF THESE:
+   - "Bind Address" → change to 0.0.0.0 or 10.108.31.151
+   - "Network Access" → enable it
+   - "Listen on WiFi" → enable it
+   - "Allow external connections" → enable it
+
+4. RESTART VLM API (toggle OFF then ON)
+
+5. VERIFY: App should show WiFi IP instead of 127.0.0.1
+
+
+TEST OPTIONS:
+=============
+
+Option A: Auto-monitor (recommended)
+  python monitor_wifi_access.py
+  (Runs tests automatically when connection detected)
+
+Option B: Manual test
+  python test_bitchat_fix.py 10.108.31.151 8765
+
+Option C: Full test suite
+  python tests/bitchat_api_test.py --ip 10.108.31.151
+
+
+IF NO WIFI SETTING EXISTS:
+===========================
+The app may only support localhost. Use ADB instead:
+
+  adb forward tcp:8765 tcp:8765
+
+Then update configs/pipeline.yaml:
+  ip: "127.0.0.1"
+
+
+SUMMARY OF CODE FIXES:
+======================
+✓ Fixed _send() to use proper multipart form data
+✓ Fixed send_scene() to send text + image correctly
+✓ Fixed send_alert() to use correct endpoints
+✓ Updated config to use WiFi IP
+✓ Created comprehensive test scripts
+
+All ready - just need Bitchat to listen on WiFi!

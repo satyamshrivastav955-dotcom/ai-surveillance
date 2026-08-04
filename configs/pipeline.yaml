@@ -11,7 +11,7 @@
 #   3. Set ip below and flip enabled to true
 bitchat:
   enabled: true             
-  ip: "10.99.134.211"       
+  ip: "172.20.73.217"          # UPDATE: Your Android WiFi IP (from Bitchat → Settings → VLM API)
   port: 8765
   # channel: "surveillance"  # Optional: uncomment to send to specific channel, otherwise uses default destination
   rate_limit_s: 5.5

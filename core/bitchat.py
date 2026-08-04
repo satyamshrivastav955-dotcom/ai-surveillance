@@ -97,22 +97,17 @@ class BitchatAlertClient:
             return False
 
     def send_scene(self, scene_text: str, frame: np.ndarray | None = None) -> None:
-        """Send VLM ambient scene description. Non-blocking."""
         msg = f"[CAM] {scene_text}"
         print(f"[bitchat] Queuing scene message: {msg[:80]}...")
         
-        # Send text message with description
         self._enqueue("/send/text", {"text": msg}, None)
         
-        # Send image separately if provided
         if frame is not None:
             import time
-            # Small delay to ensure text arrives first
-            import numpy as np
+            time.sleep(0.2)
             jpeg = _frame_to_jpeg(frame)
-            files = {"image": ("surveillance_frame.jpg", jpeg, "image/jpeg")}
-            # Schedule image send with slight delay
-            self._enqueue("/send/image", {}, frame)
+            print(f"[bitchat] Queuing scene image ({len(jpeg)} bytes)")
+            self._enqueue("/send/image", {"caption": msg}, frame)
 
     def send_alert(
         self,
@@ -121,18 +116,13 @@ class BitchatAlertClient:
         frame: np.ndarray | None = None,
         priority: bool = False,
     ) -> None:
-        """Send a surveillance alert. Non-blocking.
-
-        Args:
-            event_type: e.g. "FIRE", "FALL", "FIGHT"
-            detail:     human-readable description
-            frame:      optional camera frame to attach as image
-            priority:   if True, skip the rate limiter (for critical alerts)
-        """
         ts    = datetime.datetime.now().strftime("%H:%M:%S")
         msg   = f"[{event_type.upper()}] {ts} - {detail}"
-        endpoint = "/send/analysis" if frame is not None else "/send/text"
-        self._enqueue(endpoint, {"description": msg}, frame, skip_rate=priority)
+        
+        if frame is not None:
+            self._enqueue("/send/image", {"caption": msg}, frame, skip_rate=priority)
+        else:
+            self._enqueue("/send/text", {"text": msg}, None, skip_rate=priority)
 
     def _enqueue(
         self,
@@ -176,31 +166,34 @@ class BitchatAlertClient:
         data: dict,
         frame: np.ndarray | None,
     ) -> None:
-        url = self.base_url + endpoint
-        
-        if self.channel:
-            data["channel"] = self.channel
-
-        if frame is not None and endpoint in ("/send/analysis", "/send/image"):
+        if frame is not None and endpoint == "/send/image":
+            # Send image with caption via multipart form
+            url = self.base_url + "/send/image"
             jpeg = _frame_to_jpeg(frame)
-            description = data.get("description") or data.get("caption", "")
-            print(f"[bitchat] Sending image ({len(jpeg)} bytes)")
+            caption = data.get("caption") or data.get("description") or data.get("text", "")
+            
+            print(f"[bitchat] Sending image ({len(jpeg)} bytes) with caption")
             
             files = {"image": ("surveillance_frame.jpg", jpeg, "image/jpeg")}
-            r = requests.post(url, files=files, data={}, timeout=self.timeout)
+            form_data = {}
+            if caption:
+                form_data["caption"] = caption
+            if self.channel:
+                form_data["channel"] = self.channel
+                
+            r = requests.post(url, files=files, data=form_data, timeout=self.timeout)
             print(f"[bitchat] Response: {r.status_code} - {r.json()}")
         else:
-            # Text-only message
+            # Text-only message via /send/text
+            url = self.base_url + "/send/text"
             text_payload = data.get("text") or data.get("description", "")
             print(f"[bitchat] Sending text: {text_payload[:80]}")
+            
             payload = {"text": text_payload}
             if self.channel:
                 payload["channel"] = self.channel
-            r = requests.post(
-                self.base_url + "/send/text",
-                json=payload,
-                timeout=self.timeout,
-            )
+                
+            r = requests.post(url, json=payload, timeout=self.timeout)
             print(f"[bitchat] Response: {r.status_code} - {r.json()}")
 
         if r.status_code != 200:
