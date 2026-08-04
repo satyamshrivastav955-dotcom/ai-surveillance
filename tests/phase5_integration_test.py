@@ -400,7 +400,8 @@ def test_full_pipeline_constructs():
     sm.detect(frame, [], frame_idx=0)
     ph.detect(frame, [], [], frame_idx=0)
     ga.detect([], frame_idx=0, t=0.0)
-    vi.detect([], frame_idx=0, t=0.0)
+    if vi is not None:
+        vi.detect([], frame_idx=0, t=0.0)
     ol.detect([], frame_idx=0, t=0.0)
     mf.has_motion(frame)
 
