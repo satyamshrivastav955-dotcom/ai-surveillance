@@ -383,7 +383,8 @@ def test_full_pipeline_constructs():
     sm   = SmokingDetector(models_cfg.get("smoking", {}))
     ph   = PhoneWatcherDetector(models_cfg.get("phone", {}))
     ga   = GatheringDetector(models_cfg.get("gathering", {}))
-    vi   = ViolenceDetector(models_cfg.get("violence", {}))
+    features = cfg.get("features", {})
+    vi   = ViolenceDetector(models_cfg.get("violence", {})) if features.get("violence") else None
     ol   = ObjectLeftDetector(models_cfg.get("object_left", {}))
 
     with tempfile.TemporaryDirectory() as tmpdir:

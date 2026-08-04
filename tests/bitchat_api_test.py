@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import argparse
 import time
+import pytest
 import numpy as np
 import cv2
 import requests
 from pathlib import Path
+
+pytestmark = pytest.mark.skip(reason="Manual integration test requiring live Bitchat hardware API server")
 
 
 def create_test_image(width: int = 640, height: int = 480) -> np.ndarray:
