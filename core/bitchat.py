@@ -40,6 +40,23 @@ def _frame_to_jpeg(frame: np.ndarray, quality: int = 80) -> bytes:
     return buf.tobytes()
 
 
+def _prepare_image(frame: np.ndarray, max_dim: int = 640, quality: int = 70) -> bytes:
+    """Downscale + JPEG-encode a frame for reliable mesh delivery.
+
+    Bitchat transfers images as fragmented mesh packets; smaller images mean
+    fewer fragments and a much higher chance of successful delivery.
+    """
+    h, w = frame.shape[:2]
+    scale = min(1.0, max_dim / max(h, w))
+    if scale < 1.0:
+        frame = cv2.resize(frame, (int(w * scale), int(h * scale)),
+                           interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise RuntimeError("Failed to encode frame to JPEG")
+    return buf.tobytes()
+
+
 class BitchatAlertClient:
     """HTTP client for Bitchat's VLM API.
 
@@ -100,14 +117,15 @@ class BitchatAlertClient:
         msg = f"[CAM] {scene_text}"
         print(f"[bitchat] Queuing scene message: {msg[:80]}...")
         
-        self._enqueue("/send/text", {"text": msg}, None)
+        self._enqueue("/send/text", {"text": msg}, None, skip_rate=True)
         
         if frame is not None:
-            import time
-            time.sleep(0.2)
-            jpeg = _frame_to_jpeg(frame)
-            print(f"[bitchat] Queuing scene image ({len(jpeg)} bytes)")
-            self._enqueue("/send/image", {"caption": msg}, frame)
+            print(f"[bitchat] Queuing scene image (downscaled for mesh)")
+            # The phone's API silently drops an image sent within 5s of the
+            # previous message (rate_limit_ms=5000). Delay the image so it
+            # arrives after the phone's rate window is free.
+            self._enqueue("/send/image", {"caption": msg}, frame,
+                          skip_rate=True, delay_s=5.5)
 
     def send_alert(
         self,
@@ -130,9 +148,13 @@ class BitchatAlertClient:
         data: dict,
         frame: np.ndarray | None,
         skip_rate: bool = False,
+        delay_s: float = 0.0,
     ) -> None:
         with self._lock:
-            self._queue.append((endpoint, data, frame, skip_rate))
+            frame_copy = frame.copy() if frame is not None else None
+            self._queue.append((endpoint, data, frame_copy, skip_rate, delay_s))
+            if endpoint == "/send/image":
+                print(f"[bitchat] ENQUEUE IMAGE: queue size={len(self._queue)}, frame={'YES' if frame_copy is not None else 'NO'}")
 
     def _worker(self) -> None:
         """Background sender thread - respects rate limiting."""
@@ -145,13 +167,20 @@ class BitchatAlertClient:
                 time.sleep(0.1)
                 continue
 
-            endpoint, data, frame, skip_rate = item
+            endpoint, data, frame, skip_rate, delay_s = item
+
+            print(f"[bitchat] WORKER: Processing {endpoint}, has_frame={'YES' if frame is not None else 'NO'}")
 
             # Rate limiting - Bitchat default is 5000ms between messages
             if not skip_rate:
                 elapsed = time.perf_counter() - self._last_sent_t
                 if elapsed < self.rate_limit_s:
                     time.sleep(self.rate_limit_s - elapsed)
+
+            # Delayed send — keeps the phone's own 5s API rate window free
+            # (an image sent sooner is silently dropped by the phone).
+            if delay_s > 0:
+                time.sleep(delay_s)
 
             try:
                 self._send(endpoint, data, frame)
@@ -166,25 +195,42 @@ class BitchatAlertClient:
         data: dict,
         frame: np.ndarray | None,
     ) -> None:
-        if frame is not None and endpoint == "/send/image":
-            # Send image with caption via multipart form
-            url = self.base_url + "/send/image"
-            jpeg = _frame_to_jpeg(frame)
-            caption = data.get("caption") or data.get("description") or data.get("text", "")
-            
-            print(f"[bitchat] Sending image ({len(jpeg)} bytes) with caption")
-            
-            files = {"image": ("surveillance_frame.jpg", jpeg, "image/jpeg")}
-            form_data = {}
-            if caption:
-                form_data["caption"] = caption
-            if self.channel:
-                form_data["channel"] = self.channel
+        print(f"[bitchat] _send called: endpoint={endpoint}, frame={'YES' if frame is not None else 'NO'}")
+        
+        if endpoint == "/send/image" and frame is not None:
+            try:
+                url = self.base_url + "/send/image"
+                jpeg = _prepare_image(frame)
+                caption = data.get("caption") or data.get("description") or data.get("text", "")
                 
-            r = requests.post(url, files=files, data=form_data, timeout=self.timeout)
-            print(f"[bitchat] Response: {r.status_code} - {r.json()}")
+                print(f"[bitchat] Sending image ({len(jpeg)} bytes) with caption: {caption[:50]}")
+                
+                files = {"image": ("surveillance_frame.jpg", jpeg, "image/jpeg")}
+                form_data = {}
+                if caption:
+                    form_data["caption"] = caption
+                if self.channel:
+                    form_data["channel"] = self.channel
+
+                r = None
+                for attempt in range(2):
+                    try:
+                        r = requests.post(url, files=files, data=form_data, timeout=self.timeout)
+                        if r.status_code == 200:
+                            break
+                    except Exception as _e:
+                        print(f"[bitchat] image POST attempt {attempt + 1} failed: {_e}")
+                        if attempt == 0:
+                            time.sleep(1.0)
+                if r is None:
+                    raise RuntimeError("image POST failed after retries")
+                print(f"[bitchat] Response: {r.status_code} - {r.json()}")
+            except Exception as e:
+                print(f"[bitchat] ERROR sending image: {e}")
+                import traceback
+                traceback.print_exc()
+                return
         else:
-            # Text-only message via /send/text
             url = self.base_url + "/send/text"
             text_payload = data.get("text") or data.get("description", "")
             print(f"[bitchat] Sending text: {text_payload[:80]}")

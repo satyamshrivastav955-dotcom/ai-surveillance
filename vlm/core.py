@@ -179,14 +179,8 @@ class VLMCore:
             f"device={self._device}  vram_ceiling={self.config.max_vram_gb} GB"
         )
 
-        self._processor = AutoProcessor.from_pretrained(
-            self.config.model_name,
-            trust_remote_code=True,
-            min_pixels=self.config.min_pixels,
-            max_pixels=self.config.max_pixels,
-        )
-
-        # --- load with quantization ---
+        # Prepare quantization config before loading processor to avoid client closure issues
+        bnb_config = None
         if quant == "nf4":
             try:
                 from transformers import BitsAndBytesConfig
@@ -204,11 +198,23 @@ class VLMCore:
                 bnb_4bit_use_double_quant=True,
             )
             print("[VLM] Using bitsandbytes NF4 4-bit quantization (announced)")
+
+        self._processor = AutoProcessor.from_pretrained(
+            self.config.model_name,
+            trust_remote_code=True,
+            min_pixels=self.config.min_pixels,
+            max_pixels=self.config.max_pixels,
+            local_files_only=True,
+        )
+
+        # --- load with quantization ---
+        if quant == "nf4":
             self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.config.model_name,
                 trust_remote_code=True,
                 quantization_config=bnb_config,
                 device_map=self._device if torch.cuda.is_available() else "cpu",
+                local_files_only=True,
             )
         elif quant in ("awq", ""):
             # AWQ not available on this platform — raise with explicit message.
@@ -230,6 +236,7 @@ class VLMCore:
                 trust_remote_code=True,
                 torch_dtype=self._dtype,
                 device_map=self._device if torch.cuda.is_available() else "cpu",
+                local_files_only=True,
             )
         else:
             raise RuntimeError(
@@ -469,6 +476,8 @@ class VLMManager:
 
         self._last_escalation_frame = -1
         self._escalation_count = 0
+        self._last_escalation_t = 0.0
+        self._forced_interval_s = 15.0
 
         self._ambient_outputs: list[VLMOutput] = []
         self._escalation_outputs: list[VLMOutput] = []
@@ -513,10 +522,16 @@ class VLMManager:
         )
 
         if not should_escalate:
+            now = time.perf_counter()
+            if now - self._last_escalation_t >= self._forced_interval_s:
+                should_escalate, reason = True, "forced_interval"
+
+        if not should_escalate:
             return None
 
         self._escalation_count += 1
         self._last_escalation_frame = frame_idx
+        self._last_escalation_t = time.perf_counter()
 
         output = self._handle_escalation(frame, frame_idx, reason)
         if output:

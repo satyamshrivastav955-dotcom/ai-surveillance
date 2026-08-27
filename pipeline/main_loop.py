@@ -771,42 +771,46 @@ def run(config_path: str | None = None) -> None:
             # --- Bitchat mesh alerts -----------------------------------------
             if bitchat_client is not None:
                 _kf = frame if _bc_send_keyframes else None
-
-                # Phase4 events: FIRE, SMOKE, PHONE, SMOKING, GATHERING, VIOLENCE
+                
+                # Send alerts for all Phase 4 events
                 for ev in phase4_events:
-                    et = ev.event_type
-                    det = ev.details or {}
-                    if et == "FIRE":
-                        bitchat_client.send_alert("FIRE",  "Fire detected in camera view", _kf, priority=True)
-                    elif et == "SMOKE":
-                        bitchat_client.send_alert("SMOKE", "Smoke detected in camera view", _kf, priority=True)
-                    elif et == "PHONE":
-                        tid = det.get("track_id", "?")
-                        bitchat_client.send_alert("PHONE", f"Person id:{tid} using phone", _kf)
-                    elif et == "SMOKING":
-                        bitchat_client.send_alert("SMOKING", "Smoking detected", _kf)
-                    elif et == "GATHERING":
-                        n = det.get("count", "?")
-                        bitchat_client.send_alert("GATHERING", f"{n} people gathered", _kf)
-                    elif et == "VIOLENCE":
-                        bitchat_client.send_alert("VIOLENCE", "Violence detected", _kf, priority=True)
-
-                # Fall events
+                    bitchat_client.send_alert(
+                        event_type=ev.event_type,
+                        detail=str(ev.details),
+                        frame=_kf,
+                        priority=ev.event_type in ["FIRE", "FALL", "FIGHT", "VIOLENCE"]
+                    )
+                
+                # Send alerts for fall events
                 for ev in fall_events:
                     bitchat_client.send_alert(
-                        "FALL",
-                        f"Person id:{ev.track_id} has fallen at frame {ev.frame_idx}",
-                        _kf, priority=True,
+                        event_type="FALL",
+                        detail=f"Person id:{ev.track_id} has fallen",
+                        frame=_kf,
+                        priority=True
+                    )
+                
+                # Send alerts for fight events
+                for ev in fight_events:
+                    bitchat_client.send_alert(
+                        event_type="FIGHT",
+                        detail=f"Fight between persons {ev.track_ids}",
+                        frame=_kf,
+                        priority=True
+                    )
+                
+                # Send alerts for identity events
+                for ev in identity_events:
+                    bitchat_client.send_alert(
+                        event_type="IDENTITY",
+                        detail=f"Track {ev.track_id} identified as {ev.label}",
+                        frame=_kf,
+                        priority=False
                     )
 
-                # Fight events
-                for ev in fight_events:
-                    ids = getattr(ev, "track_ids", [])
-                    bitchat_client.send_alert(
-                        "FIGHT",
-                        f"Fight between persons {ids} detected",
-                        _kf, priority=True,
-                    )
+
+
+
 
             # --- Phase 5F: EventBuffer — aggregate + windowed JSON flush ---
             if event_buffer is not None:
