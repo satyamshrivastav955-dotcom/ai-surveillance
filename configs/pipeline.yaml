@@ -15,7 +15,7 @@ bitchat:
   port: 8765
   # channel: "surveillance"  # Optional: uncomment to send to specific channel, otherwise uses default destination
   rate_limit_s: 5.5
-  send_keyframes: false     # alerts are text-only; only the VLM sends 1 photo per description
+  send_keyframes: false     # no detector logs are sent — only the VLM image + description
   send_scene: true
 
 source:

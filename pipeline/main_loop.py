@@ -380,7 +380,6 @@ def run(config_path: str | None = None) -> None:
     except Exception as _bc_e:
         print(f"[bitchat] WARN: could not initialise Bitchat client: {_bc_e}")
 
-    _bc_send_keyframes = cfg.get("bitchat", {}).get("send_keyframes", True)
     _bc_send_scene     = cfg.get("bitchat", {}).get("send_scene", True)
 
     source: VideoSource = build_source(src_cfg)
@@ -769,48 +768,10 @@ def run(config_path: str | None = None) -> None:
                     event_logger.log_event(ev, frame, frame_idx)
 
             # --- Bitchat mesh alerts -----------------------------------------
-            if bitchat_client is not None:
-                _kf = frame if _bc_send_keyframes else None
-                
-                # Send alerts for all Phase 4 events
-                for ev in phase4_events:
-                    bitchat_client.send_alert(
-                        event_type=ev.event_type,
-                        detail=str(ev.details),
-                        frame=_kf,
-                        priority=ev.event_type in ["FIRE", "FALL", "FIGHT", "VIOLENCE"]
-                    )
-                
-                # Send alerts for fall events
-                for ev in fall_events:
-                    bitchat_client.send_alert(
-                        event_type="FALL",
-                        detail=f"Person id:{ev.track_id} has fallen",
-                        frame=_kf,
-                        priority=True
-                    )
-                
-                # Send alerts for fight events
-                for ev in fight_events:
-                    bitchat_client.send_alert(
-                        event_type="FIGHT",
-                        detail=f"Fight between persons {ev.track_ids}",
-                        frame=_kf,
-                        priority=True
-                    )
-                
-                # Send alerts for identity events
-                for ev in identity_events:
-                    bitchat_client.send_alert(
-                        event_type="IDENTITY",
-                        detail=f"Track {ev.track_id} identified as {ev.label}",
-                        frame=_kf,
-                        priority=False
-                    )
-
-
-
-
+            # No detector event logs are sent (the user only wants the image +
+            # VLM description, handled in the VLM result block above).  This
+            # also keeps the phone's 5s API rate window free so the image and
+            # description are not silently dropped by Bitchat.
 
             # --- Phase 5F: EventBuffer — aggregate + windowed JSON flush ---
             if event_buffer is not None:
