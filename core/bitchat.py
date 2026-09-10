@@ -10,13 +10,8 @@ Setup:
   4. import and use BitchatAlertClient from this module
 
 Sent to Bitchat mesh:
-  - VLM scene description (every ambient pass)
-  - FIRE / SMOKE alerts with keyframe image
-  - FALL alerts with keyframe image
-  - FIGHT alerts with keyframe image
-  - PHONE detected
-  - GATHERING (crowd)
-  - VIOLENCE (when enabled)
+  - Keyframe image followed by its VLM description (per escalated VLM pass)
+  - No detector event logs — only the image + what the VLM actually saw
 """
 from __future__ import annotations
 
@@ -114,18 +109,19 @@ class BitchatAlertClient:
             return False
 
     def send_scene(self, scene_text: str, frame: np.ndarray | None = None) -> None:
-        msg = f"[CAM] {scene_text}"
-        print(f"[bitchat] Queuing scene message: {msg[:80]}...")
-        
-        self._enqueue("/send/text", {"text": msg}, None, skip_rate=True)
-        
+        """Send a keyframe image then its VLM description — nothing else.
+
+        Order matters: the image goes first so the user sees what the camera
+        captured, then the description text is sent after Bitchat's own 5s API
+        rate window has passed (messages sent sooner are silently dropped).
+        """
         if frame is not None:
             print(f"[bitchat] Queuing scene image (downscaled for mesh)")
-            # The phone's API silently drops an image sent within 5s of the
-            # previous message (rate_limit_ms=5000). Delay the image so it
-            # arrives after the phone's rate window is free.
-            self._enqueue("/send/image", {"caption": msg}, frame,
+            self._enqueue("/send/image", {"caption": scene_text}, frame, skip_rate=True)
+            self._enqueue("/send/text", {"text": scene_text}, None,
                           skip_rate=True, delay_s=5.5)
+        else:
+            self._enqueue("/send/text", {"text": scene_text}, None, skip_rate=True)
 
     def send_alert(
         self,
