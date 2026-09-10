@@ -329,10 +329,18 @@ class VLMCore:
         print(f"[vlm] Scene: {self._last_scene_description}")
 
         # --- Pass 2: Structured entity extraction for alerting logic ---
+        # Best-effort: the model often answers the JSON prompt with extra text,
+        # which the parser rejects.  That must NOT throw away the scene
+        # description from pass 1 — the description is the deliverable.  The
+        # failure is still surfaced loudly, but entities degrade to [].
         text_prompt = prompt or self.ENTITY_PROMPT
-        return self._parse_entities_from_text(
-            self._run_single_prompt(frame, text_prompt)
-        )
+        try:
+            return self._parse_entities_from_text(
+                self._run_single_prompt(frame, text_prompt)
+            )
+        except ValueError as e:
+            print(f"[vlm] WARN: entity extraction failed — using empty entities. {e}")
+            return []
 
     def _run_single_prompt(self, frame: np.ndarray, prompt: str) -> str:
         """Run the model with a single text prompt on a frame. Returns raw text output."""
@@ -476,7 +484,7 @@ class VLMManager:
 
         self._last_escalation_frame = -1
         self._escalation_count = 0
-        self._last_escalation_t = 0.0
+        self._last_escalation_t = time.perf_counter()
         self._forced_interval_s = 15.0
 
         self._ambient_outputs: list[VLMOutput] = []
@@ -583,3 +591,4 @@ class VLMManager:
         self._frame_buffer.clear()
         self._escalation_count = 0
         self._last_escalation_frame = -1
+        self._last_escalation_t = time.perf_counter()
